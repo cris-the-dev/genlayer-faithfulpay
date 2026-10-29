@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaithfulPay</title><meta name="description" content="Translation escrow paid when GenLayer validators agree the translation is faithful"><meta name="theme-color" content="#E6EAE3">
+<link rel="stylesheet" href="app.css"><link rel="icon" href="logo.svg" type="image/svg+xml">
+<style>
+.notice{margin-top:14px;padding:12px 16px;border:1px dashed var(--ink);font-size:15px;background:var(--sheet)}
+.notice b{font:600 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;display:block;margin-bottom:4px}
+.ruling i{display:block;margin-top:6px;font-size:14px;color:var(--mut)}
+.sig{word-break:break-all;font:12px/1.5 var(--mono)}
+.issues{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.issues code{font:12px var(--mono);padding:2px 6px;border:1px solid var(--blood);color:var(--blood)}
+.more{margin-top:12px}
+</style>
+</head><body>
+<div class="bar"><div class="w"><span class="who">cristhedev / genlayer builds</span><nav id="sites"></nav></div></div>
+<header class="mast"><div class="w">
+  <div class="top"><span class="live">Translation escrow · Testnet Bradbury</span>
+    <div class="links">
+      <a id="contract-link" href="#">Contract ↗</a>
+      <a href="https://github.com/cris-the-dev/genlayer-faithfulpay">Source ↗</a>
+      <button id="connect" type="button">Connect wallet</button>
+    </div></div>
+  <div class="title">
+    <svg viewBox="0 0 64 64" aria-hidden="true"><use href="logo.svg#m"/></svg>
+    <h1>Faithful<em>Pay</em></h1>
+    <p>The client escrows the fee; the translator is paid when GenLayer validators agree nothing was left out or changed.</p>
+  </div>
+</div></header>
+<div class="w"><div class="stats" id="stats">
+    <div class="stat"><b>–</b><span>Jobs</span></div><div class="stat"><b>–</b><span>Open</span></div>
+    <div class="stat"><b>–</b><span>Paid</span></div><div class="stat"><b>–</b><span>In escrow (GEN)</span></div>
+  </div></div>
+<main class="w">
+  <p id="status" class="status" hidden></p>
+  <div class="grid">
+    <div>
+      <section>
+        <p class="label">Jobs</p>
+        <div class="list" id="jobs"><p class="empty">Reading the contract…</p></div>
+      </section>
+      <section id="detail" hidden></section>
+    </div>
+
+    <aside>
+      <section>
+        <p class="label">How a translation is judged</p>
+        <ol class="how">
+          <li><span>I</span><div><b>Escrow</b><p>The client names the translator, the source page and its SHA-256, the target language, required terms and a deadline, and pays the fee. Validators fetch the source now.</p></div></li>
+          <li><span>II</span><div><b>Submit</b><p>The translator publishes the translation and submits its URL and SHA-256.</p></div></li>
+          <li><span>III</span><div><b>Terms</b><p>Validators fetch both pages, check both hashes, and look for each required term in the text (no AI).</p></div></li>
+          <li><span>IV</span><div><b>Faithfulness</b><p>They agree on the exact list of issues: <i>omission</i>, <i>mistranslation</i>, <i>wrong language</i>.</p></div></li>
+        </ol>
+        <div class="outcomes">
+          <div class="ok"><b>No issues</b>the fee goes to the translator; the translation's hash is stored</div>
+          <div class="bad"><b>Issues</b>listed for the fix; after 3 attempts or the deadline, the client is refunded</div>
+        </div>
+      </section>
+      <section>
+        <p class="label">Disclosures</p>
+        <div class="notice"><b>Pinned pages</b>The source is bound to the hash the client gave, the translation to the hash the translator gives. If either page changes or cannot be fetched, the submission reverts and uses no attempt.</div>
+        <div class="notice"><b>Whole pages only</b>A page whose text is over 12,000 characters is refused, never cut: nothing is judged on part of the text.</div>
+        <div class="notice"><b>What the verdict means</b>Validators agree only on the issue list. The one-sentence note is the leader's own and is not checked by consensus.</div>
+      </section>
+      <section>
+        <details>
+          <summary>Post a job</summary>
+          <form id="create">
+            <label>Translator's address<input name="translator" pattern="0x[0-9a-fA-F]{40}" required></label>
+            <label>Source page URL<input name="source" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
+            <label>Source SHA-256<input name="ssha" pattern="[0-9a-fA-F]{64}" required></label>
+            <p class="hint">Run <code>curl -s URL | shasum -a 256</code>, or try “Fill hash”.</p>
+            <div class="row">
+              <label>Target language<input name="language" minlength="2" maxlength="40" required placeholder="Vietnamese"></label>
+              <label>Days<input name="days" type="number" min="1" max="90" value="7" required></label>
+            </div>
+            <label>Required terms, one per line (optional, max 20)<textarea name="terms"></textarea></label>
+            <label>Fee (GEN)<input name="fee" inputmode="decimal" value="0.001" required></label>
+            <div class="row"><button type="button" class="ghost" id="fill-ssha">Fill hash</button><button type="submit">Escrow fee and post</button></div>
+          </form>
+        </details>
+      </section>
+    </aside>
+  </div>
+</main>
+
+<script type="module">
+import { contract, wireWallet, send, status, gen, toWei, esc, short, $, EXPLORER, payingTx, finalizeTx } from "./gl.js";
+const ADDR = "0xBB122Fc6Ca64Dcfa9759bEFfd1C912cA7f9E72bb";
+const fp = contract(ADDR);
+const B = BigInt, PER = 20;
+let me = null, items = [], view = { id: null, subs: [], next: 0, payouts: [], pnext: 0 };
+const when = (ts) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" }) + " UTC" : "–";
+const addr = (a) => `<a class="mono" href="${EXPLORER}/address/${esc(a)}">${short(a)}</a>${me && a.toLowerCase() === me.toLowerCase() ? " (you)" : ""}`;
+const sha256 = async (buf) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const cls = { OPEN: "", PAID: "ok", REFUNDED: "bad" };
+$("#contract-link").href = `${EXPLORER}/address/${ADDR}`;
+$("#contract-link").textContent = `Contract ${short(ADDR)} ↗`;
+
+async function load(openId) {
+  try {
+    const all = [];
+    for (let s = 0; s !== null; ) { const r = await fp.read("get_jobs", [s, 50]); all.push(...r.items); s = r.next; }
+    items = all.reverse();
+    const n = (st) => items.filter((j) => j.status === st).length;
+    const held = items.filter((j) => j.status === "OPEN").reduce((t, j) => t + B(j.amount), 0n);
+    $("#stats").innerHTML = [[items.length, "Jobs"], [n("OPEN"), "Open"], [n("PAID"), "Paid"], [gen(held), "In escrow (GEN)"]]
+      .map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
+    $("#jobs").innerHTML = items.length ? items.map((j) => `<a class="item" href="#job-${j.id}" data-id="${j.id}">
+      <div><b>${esc(j.language)} · ${gen(j.amount)} GEN</b><small>#${j.id} · ${j.status.toLowerCase()} · ${j.attempts} attempt${j.attempts === 1 ? "" : "s"}</small></div></a>`).join("")
+      : `<p class="empty">No jobs yet.</p>`;
+    const h = location.hash.match(/^#job-(\d+)$/), id = openId ?? (h ? Number(h[1]) : null);
+    if (items.length) await open(Number.isInteger(id) && items.some((j) => j.id === id) ? id : items[0].id);
+  } catch (e) {
+    $("#jobs").innerHTML = `<p class="empty">Could not read the contract: ${esc(e.message)}</p>`;
+  }
+}
+async function moreSubs() {
+  const r = await fp.read("get_submissions", [view.id, view.next, PER]);
+  view.subs.push(...r.items);
+  view.next = r.next;
+}
+async function morePayouts() {
+  const r = await fp.read("get_payouts", [view.pnext, 20, true]);
+  view.payouts.push(...r.items);
+  view.pnext = r.next;
+}
+async function open(id) {
+  view = { id, subs: [], next: 0, payouts: [], pnext: 0 };
+  await moreSubs();
+  await morePayouts();
+  await show();
+}
+
+function actions(j, recov, now) {
+  if (!me) return `<p class="connect-hint">Connect a wallet to submit, decline or refund.</p>`;
+  const out = [], mine = (x) => x.toLowerCase() === me.toLowerCase(), open = j.status === "OPEN";
+  if (open && mine(j.translator) && j.attempts_left > 0 && now <= j.deadline) {
+    out.push(`<form data-form="submit"><b>Submit the translation (${j.attempts_left} attempt${j.attempts_left === 1 ? "" : "s"} left)</b>
+      <label>Translation URL<input name="url" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
+      <label>Translation SHA-256<input name="sha" pattern="[0-9a-fA-F]{64}" required></label>
+      <p class="hint">Keep the page unchanged until validators have fetched it. <code>curl -s URL | shasum -a 256</code></p>
+      <div class="row"><button type="button" class="ghost" data-act="hash">Fill hash</button><button>Submit for review</button></div></form>`);
+  }
+  if (open && mine(j.translator)) out.push(`<form data-form="decline" class="row" style="align-items:end"><p class="hint">Declining refunds the client.</p><div><button class="ghost">Decline job</button></div></form>`);
+  if (open && j.refundable) out.push(`<form data-form="refund" class="row" style="align-items:end"><p class="hint">${j.attempts_left === 0 ? "All attempts were rejected." : "The deadline has passed."} Anyone can refund the client.</p><div><button>Refund ${gen(j.amount)} GEN</button></div></form>`);
+  if (B(recov) > 0n) out.push(`<form data-form="recover" class="row" style="align-items:end"><label>Recover ${gen(recov)} GEN from a failed transfer, to<input name="to" pattern="0x[0-9a-fA-F]{40}" value="${esc(me)}" required></label><div><button>Recover</button></div></form>`);
+  return out.length ? `<div style="display:grid;gap:16px;margin-top:20px">${out.join("")}</div>` : "";
+}
+
+function verdict(s, terms) {
+  const name = (i) => i.startsWith("missing_term:") ? `missing term “${esc(terms[Number(i.slice(13))] ?? i)}”` : esc(i.replace("_", " "));
+  const ok = s.issues.length === 0;
+  return `<div class="ruling ${ok ? "ok" : "bad"}"><b>${ok ? "Consensus: faithful. Fee paid to the translator." : "Consensus: issues found"}</b>
+    ${ok ? "" : `<div class="issues">${s.issues.map((i) => `<code>${name(i)}</code>`).join("")}</div>`}
+    ${s.note ? `<i>Leader's note (not verified by consensus): ${esc(s.note)}</i>` : ""}</div>`;
+}
+
+async function show() {
+  const j = items.find((x) => x.id === view.id);
+  const [recov, tr] = await Promise.all([me ? fp.read("get_recoverable", [me]) : 0, fp.read("get_translator", [j.translator])]);
+  const el = $("#detail"), now = Math.floor(Date.now() / 1000);
+  el.hidden = false;
+  el.innerHTML = `<div class="dhead"><div><small>Job #${j.id} · posted ${when(j.at)} · due ${when(j.deadline)}</small><h2>Into ${esc(j.language)} <span class="tag ${cls[j.status]}">${j.status.toLowerCase()}</span></h2>
+    <p>source <a href="${esc(j.source_url)}" rel="noopener nofollow">${esc(j.source_url)} ↗</a> · sha256 <span class="mono">${j.source_sha256.slice(0, 16)}…</span></p>
+    <p>client ${addr(j.client)} · translator ${addr(j.translator)} (${tr.paid} paid, ${tr.rejected} refunded after rejections)</p>
+    ${j.status === "PAID" ? `<p>paid translation <a href="${esc(j.translation_url)}" rel="noopener nofollow">${esc(j.translation_url)} ↗</a> · sha256 <span class="mono sig">${esc(j.translation_sha256)}</span></p>` : ""}</div></div>
+    <div class="mini">
+      <div><span>Fee</span><b>${gen(j.amount)} GEN</b></div>
+      <div><span>Attempts</span><b>${j.attempts} / 3</b></div>
+      <div><span>Required terms</span><b>${j.terms.length ? j.terms.map(esc).join(", ") : "none"}</b></div>
+      <div><span>Status</span><b>${j.status}</b></div>
+    </div>
+    <h3>Submissions (${j.attempts})</h3>
+    ${view.subs.length ? view.subs.map((s) => `<div class="case">
+      <div class="case-top"><span class="id">${s.id}</span><span class="by">${when(s.at)} · <a href="${esc(s.url)}" rel="noopener nofollow">${esc(s.url)}</a> · sha256 ${s.sha256.slice(0, 16)}…</span></div>
+      ${verdict(s, j.terms)}
+    </div>`).join("") : `<p class="hint">Nothing submitted yet.</p>`}
+    ${view.next !== null ? `<button class="ghost more" data-act="more-subs">More submissions</button>` : ""}
+    <h3>Unsettled transfers</h3>
+    <p class="hint">A payment is marked delivered or failed from its own transfer result, once the paying transaction is finalized. Anyone can settle.</p>
+    ${view.payouts.length ? `<div class="tbl"><table><tbody>${view.payouts.map((p) => `<tr><td class="num mut">#${p.id}</td><td>${esc(p.kind)}, ${gen(p.amount)} GEN to ${addr(p.to)}</td><td class="r">${me ? `<button class="ghost" data-act="settle_payout" data-arg="${p.id}">Settle</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
+      : `<p class="hint">None${view.pnext !== null ? " in the range read so far" : ""}.</p>`}
+    ${view.pnext !== null ? `<button class="ghost more" data-act="more-payouts">More transfers</button>` : ""}
+    ${actions(j, recov, now)}`;
+  document.querySelectorAll("#jobs .item").forEach((x) => x.toggleAttribute("aria-current", Number(x.dataset.id) === j.id));
+}
+
+async function settle(pid) {
+  const p = await fp.read("get_payout", [pid]);
+  let tx = payingTx(ADDR, p.sender, p.at);
+  if (!tx) tx = prompt(`Payout #${pid} was created by a transaction from ${p.sender} at ${when(p.at)}. Paste that GenLayer transaction hash (0x…):`)?.trim();
+  if (!tx) return;
+  status(`Settle payout #${pid}: looking up the finalization of ${short(tx)}…`);
+  const fin = await finalizeTx(tx).catch(() => null);
+  if (!fin) return status(`Settle payout #${pid}: the paying transaction is not finalized yet (or not found). Try again later.`, true);
+  if (await send(fp, `Settle payout #${pid}`, "settle_payout", [pid, tx, fin], 0n, async () => (await fp.read("get_payout", [pid])).status !== "SENT")) load(view.id);
+}
+const hashOf = (url) => fetch(url).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject())).then(sha256);
+async function fill(input, url) {
+  const h = url ? await hashOf(url).catch(() => "") : "";
+  if (h) input.value = h;
+  status(h ? "Hash filled from your browser." : "Could not read the page from the browser (blocked by the site). Hash it with curl.", !h);
+}
+
+$("#jobs").addEventListener("click", (e) => { const t = e.target.closest(".item[data-id]"); if (t) { e.preventDefault(); history.replaceState(null, "", `#job-${t.dataset.id}`); open(Number(t.dataset.id)); $("#detail").scrollIntoView({ behavior: "smooth" }); } });
+$("#detail").addEventListener("click", async (e) => {
+  const fn = e.target.dataset?.act;
+  if (!fn) return;
+  if (fn === "more-subs") { await moreSubs(); return show(); }
+  if (fn === "more-payouts") { await morePayouts(); return show(); }
+  if (fn === "settle_payout") return settle(Number(e.target.dataset.arg));
+  if (fn === "hash") { const f = e.target.closest("form"); return fill(f.sha, f.url.value); }
+});
+$("#detail").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target, fn = f.dataset.form, id = view.id, j = items.find((x) => x.id === id);
+  let args = [id], check, payee; // payee: who the call may pay (see gl.js)
+  const after = (ok) => async () => ok(await fp.read("get_job", [id]));
+  if (fn === "submit") { args = [id, f.url.value.trim(), f.sha.value.toLowerCase()]; payee = j.translator; check = after((x) => x.attempts === j.attempts + 1); }
+  else if (fn === "decline" || fn === "refund") { payee = j.client; check = after((x) => x.status === "REFUNDED"); }
+  else { args = [f.to.value]; payee = f.to.value; check = async () => B(await fp.read("get_recoverable", [me])) === 0n; }
+  if (await send(fp, fn, fn, args, 0n, check, payee)) load(id);
+});
+$("#fill-ssha").addEventListener("click", () => { const f = $("#create"); fill(f.ssha, f.source.value); });
+$("#create").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    const terms = f.terms.value.split("\n").map((t) => t.trim()).filter(Boolean);
+    const n = items.length, args = [f.translator.value.trim(), f.source.value.trim(), f.ssha.value.toLowerCase(), f.language.value.trim(), JSON.stringify(terms), Number(f.days.value)];
+    if (await send(fp, "Post job", "create_job", args, toWei(f.fee.value), async () => (await fp.read("get_jobs", [0, 1])).total === n + 1)) { f.reset(); load(n); }
+  } catch (err) { status(err.message, true); }
+});
+wireWallet((a) => { me = a; if (view.id !== null) show(); });
+load();
+</script>
+
+<footer><div class="w"><span>Built on <a href="https://genlayer.com">GenLayer</a></span><a href="https://github.com/cris-the-dev/genlayer-faithfulpay">Source</a></div></footer>
+<script>
+document.getElementById("sites").innerHTML=[["ProofBounty","proofbounty"],["ProofBounty v2","proofbounty-v2"],["IC Security Audit","ic-security-audit"],["Oracle Kit","oracle-kit"],["Workshop","workshop"],["Security Docs","docs-security"],["Rainfall Insurance","rainfall-insurance"],["DealCourt","dealcourt"],["GoalStake","goalstake"],["MandateGuard","mandateguard"],["SLA Bond","slabond"],["Attest","attest"],["SponsorPay","sponsorpay"],["ModCourt","modcourt"],["CorrectionDesk","correctiondesk"],["FaithfulPay","faithfulpay"]]
+ .map(([n,s])=>`<a href="https://${s}.cristhedev.com"${s==="faithfulpay"?' aria-current="page"':""}>${n}</a>`).join("");
+</script>
+</body></html>
