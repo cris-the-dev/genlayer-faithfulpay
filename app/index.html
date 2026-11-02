@@ -1,6 +1,8 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FaithfulPay</title><meta name="description" content="Translation escrow paid when GenLayer validators agree the translation is faithful"><meta name="theme-color" content="#E6EAE3">
+<title>FaithfulPay: pay for translations you can't read, safely</title>
+<meta name="description" content="Escrow for translation jobs. GenLayer validators check the delivered translation against the source: nothing left out, nothing changed, required terms used. Faithful work is paid instantly; otherwise the client is refunded.">
+<meta name="theme-color" content="#E6EAE3">
 <link rel="stylesheet" href="app.css"><link rel="icon" href="logo.svg" type="image/svg+xml">
 <style>
 .notice{margin-top:14px;padding:12px 16px;border:1px dashed var(--ink);font-size:15px;background:var(--sheet)}
@@ -11,75 +13,109 @@
 .more{margin-top:12px}
 </style>
 </head><body>
-<div class="bar"><div class="w"><span class="who">cristhedev / genlayer builds</span><nav id="sites"></nav></div></div>
-<header class="mast"><div class="w">
-  <div class="top"><span class="live">Translation escrow · Testnet Bradbury</span>
-    <div class="links">
-      <a id="contract-link" href="#">Contract ↗</a>
-      <a href="https://github.com/cris-the-dev/genlayer-faithfulpay">Source ↗</a>
-      <button id="connect" type="button">Connect wallet</button>
-    </div></div>
-  <div class="title">
-    <svg viewBox="0 0 64 64" aria-hidden="true"><use href="logo.svg#m"/></svg>
-    <h1>Faithful<em>Pay</em></h1>
-    <p>The client escrows the fee; the translator is paid when GenLayer validators agree nothing was left out or changed.</p>
-  </div>
+<header class="nav" id="nav"><div class="w">
+  <a class="brand" href="#top"><svg viewBox="0 0 64 64" aria-hidden="true"><use href="logo.svg#m"/></svg><span>Faithful<em>Pay</em></span></a>
+  <nav><a href="#how">How it works</a><a href="#who">Clients &amp; translators</a><a href="#app">Jobs</a><a href="#faq">FAQ</a><a href="https://github.com/cris-the-dev/genlayer-faithfulpay#readme">Docs</a></nav>
+  <button id="connect" type="button">Connect wallet</button>
 </div></header>
-<div class="w"><div class="stats" id="stats">
-    <div class="stat"><b>–</b><span>Jobs</span></div><div class="stat"><b>–</b><span>Open</span></div>
-    <div class="stat"><b>–</b><span>Paid</span></div><div class="stat"><b>–</b><span>In escrow (GEN)</span></div>
-  </div></div>
-<main class="w">
-  <p id="status" class="status" hidden></p>
-  <div class="grid">
-    <div>
-      <section>
-        <p class="label">Jobs</p>
-        <div class="list" id="jobs"><p class="empty">Reading the contract…</p></div>
-      </section>
-      <section id="detail" hidden></section>
-    </div>
 
-    <aside>
-      <section>
-        <p class="label">How a translation is judged</p>
-        <ol class="how">
-          <li><span>I</span><div><b>Escrow</b><p>The client names the translator, the source page and its SHA-256, the target language, required terms and a deadline, and pays the fee. Validators fetch the source now.</p></div></li>
-          <li><span>II</span><div><b>Submit</b><p>The translator publishes the translation and submits its URL and SHA-256.</p></div></li>
-          <li><span>III</span><div><b>Terms</b><p>Validators fetch both pages, check both hashes, and look for each required term in the text (no AI).</p></div></li>
-          <li><span>IV</span><div><b>Faithfulness</b><p>They agree on the exact list of issues: <i>omission</i>, <i>mistranslation</i>, <i>wrong language</i>.</p></div></li>
-        </ol>
-        <div class="outcomes">
-          <div class="ok"><b>No issues</b>the fee goes to the translator; the translation's hash is stored</div>
-          <div class="bad"><b>Issues</b>listed for the fix; after 3 attempts or the deadline, the client is refunded</div>
-        </div>
-      </section>
-      <section>
-        <p class="label">Disclosures</p>
-        <div class="notice"><b>Pinned pages</b>The source is bound to the hash the client gave, the translation to the hash the translator gives. If either page changes or cannot be fetched, the submission reverts and uses no attempt.</div>
-        <div class="notice"><b>Whole pages only</b>A page whose text is over 12,000 characters is refused, never cut: nothing is judged on part of the text.</div>
-        <div class="notice"><b>What the verdict means</b>Validators agree only on the issue list. The one-sentence note is the leader's own and is not checked by consensus.</div>
-      </section>
-      <section>
-        <details>
-          <summary>Post a job</summary>
-          <form id="create">
-            <label>Translator's address<input name="translator" pattern="0x[0-9a-fA-F]{40}" required></label>
-            <label>Source page URL<input name="source" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
-            <label>Source SHA-256<input name="ssha" pattern="[0-9a-fA-F]{64}" required></label>
-            <p class="hint">Run <code>curl -s URL | shasum -a 256</code>, or try “Fill hash”.</p>
-            <div class="row">
-              <label>Target language<input name="language" minlength="2" maxlength="40" required placeholder="Vietnamese"></label>
-              <label>Days<input name="days" type="number" min="1" max="90" value="7" required></label>
-            </div>
-            <label>Required terms, one per line (optional, max 20)<textarea name="terms"></textarea></label>
-            <label>Fee (GEN)<input name="fee" inputmode="decimal" value="0.001" required></label>
-            <div class="row"><button type="button" class="ghost" id="fill-ssha">Fill hash</button><button type="submit">Escrow fee and post</button></div>
-          </form>
-        </details>
-      </section>
-    </aside>
+<main id="top">
+<section class="hero"><div class="w">
+  <div>
+    <span class="live">Live on GenLayer Testnet Bradbury</span>
+    <h1>Pay for a translation <em>you can't read</em>, and know it's all there.</h1>
+    <p class="lede">You order a notice in Vietnamese. Is a paragraph missing? Did a number change? FaithfulPay holds the fee in escrow until GenLayer validators agree the translation is faithful to the source, then pays the translator in the same transaction.</p>
+    <div class="cta"><a class="btn" href="#post">Post a translation job</a><a class="btn ghost" href="#app">See real jobs</a></div>
   </div>
+  <article class="proof" aria-label="Example: job 0, English to Vietnamese">
+    <header><span>Job #0 · English → Vietnamese</span><span>0.001 GEN</span></header>
+    <div class="att bad"><b>Attempt 1</b><code>omission</code><p>“Run the cold tap for five minutes before drinking it.” was left out.</p></div>
+    <div class="att"><b>Attempt 2</b><em>reverted</em><p>Page changed after it was hashed (14:00 → 16:00). No attempt used.</p></div>
+    <div class="att ok"><b>Attempt 3</b><code>[ ]</code><p>No issues. Fee paid to the translator; translation hash stored.</p></div>
+    <footer><span class="stampmini">Paid</span><a href="#job-0" data-show="0">Open on-chain →</a></footer>
+  </article>
+</div></section>
+
+<div class="w"><div class="stats" id="stats">
+  <div class="stat"><b>–</b><span>Jobs</span></div><div class="stat"><b>–</b><span>Open</span></div>
+  <div class="stat"><b>–</b><span>Paid</span></div><div class="stat"><b>–</b><span>In escrow (GEN)</span></div>
+</div></div>
+
+<section class="sec" id="how"><div class="w">
+  <p class="label">How it works</p>
+  <h2 class="big">An escrow that reads both languages.</h2>
+  <ol class="how wide">
+    <li><span>I</span><div><b>Escrow</b><p>The client names the translator, the source page and its SHA-256, the target language, required terms and a deadline, and pays the fee. Validators fetch the source right away.</p></div></li>
+    <li><span>II</span><div><b>Deliver</b><p>The translator publishes the translation and submits its URL and SHA-256. Both pages are pinned by hash.</p></div></li>
+    <li><span>III</span><div><b>Check</b><p>Each required term must appear in the text. Then validators agree on the exact list of issues: omission, mistranslation, wrong language.</p></div></li>
+    <li><span>IV</span><div><b>Settle</b><p>No issues: paid in the same transaction. Issues: listed so the translator can fix them, up to three attempts, then the client is refunded.</p></div></li>
+  </ol>
+</div></section>
+
+<section class="sec" id="who"><div class="w">
+  <p class="label">Built for both sides</p>
+  <div class="two">
+    <div class="sheet"><h3 class="h">For clients</h3><ul>
+      <li>Order translations into languages you can't check yourself.</li>
+      <li>The fee is released only for a complete, faithful translation.</li>
+      <li>Insist on product names, figures or legal terms with required terms.</li>
+      <li>Missed deadline or three failed attempts: anyone can refund you.</li>
+    </ul></div>
+    <div class="sheet"><h3 class="h">For translators</h3><ul>
+      <li>The money is locked before you start. No chasing invoices.</li>
+      <li>Paid the moment validators agree, not when someone gets round to it.</li>
+      <li>Feedback is a concrete issue list, not “we're not happy”.</li>
+      <li>Style and word choice are never held against you; only meaning is.</li>
+    </ul></div>
+  </div>
+  <div class="disc">
+    <div class="notice"><b>Pinned pages</b>The source is bound to the hash the client gave, the translation to the hash the translator gives. If either page changes or cannot be fetched, the submission reverts and uses no attempt.</div>
+    <div class="notice"><b>Whole pages only</b>A page whose text is over 12,000 characters is refused, never cut: nothing is judged on part of the text.</div>
+    <div class="notice"><b>What the verdict means</b>Validators agree only on the issue list. The one-sentence note is the leader's own and is not checked by consensus.</div>
+  </div>
+</div></section>
+
+<section class="sec" id="app"><div class="w">
+  <p class="label">Jobs</p>
+  <h2 class="big">Every job, read live from the contract.</h2>
+  <p id="status" class="status" hidden></p>
+  <div class="list" id="jobs"><p class="empty">Reading the contract…</p></div>
+  <section id="detail" hidden></section>
+  <div id="post" class="postbox">
+    <details>
+      <summary>Post a translation job</summary>
+      <form id="create">
+        <label>Translator's address<input name="translator" pattern="0x[0-9a-fA-F]{40}" required></label>
+        <label>Source page URL<input name="source" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
+        <label>Source SHA-256<input name="ssha" pattern="[0-9a-fA-F]{64}" required></label>
+        <p class="hint">Run <code>curl -s URL | shasum -a 256</code>, or try “Fill hash”.</p>
+        <div class="row">
+          <label>Target language<input name="language" minlength="2" maxlength="40" required placeholder="Vietnamese"></label>
+          <label>Days<input name="days" type="number" min="1" max="90" value="7" required></label>
+          <label>Fee (GEN)<input name="fee" inputmode="decimal" value="0.001" required></label>
+        </div>
+        <label>Required terms, one per line (optional, max 20)<textarea name="terms"></textarea></label>
+        <div class="row"><button type="button" class="ghost" id="fill-ssha">Fill hash</button><button type="submit">Escrow fee and post</button></div>
+      </form>
+    </details>
+  </div>
+</div></section>
+
+<section class="sec" id="faq"><div class="w">
+  <p class="label">FAQ</p>
+  <div class="faq">
+    <details><summary>Who decides whether a translation is faithful?</summary><p>GenLayer validators. Each one fetches both pages itself, checks their hashes, and answers three narrow questions: is anything missing, does anything say something different, is it the right language. A result is accepted only when they agree on the same issue list.</p></details>
+    <details><summary>Will I be rejected for word choice or style?</summary><p>No. Only meaning counts: omissions, changed meaning and the wrong language. Phrasing a sentence differently is not an issue.</p></details>
+    <details><summary>Can the translator swap the page after it is checked?</summary><p>No. The translation is pinned by its SHA-256 when submitted, and the paid URL and hash stay on the job. A page that changed reverts the submission without using an attempt.</p></details>
+    <details><summary>What if the translator never delivers?</summary><p>After the deadline, or after three rejected attempts, anyone can trigger the refund and the fee goes back to the client. The translator can also decline, which refunds immediately.</p></details>
+    <details><summary>How long are the documents?</summary><p>Up to 12,000 characters of visible text per page. Longer pages are refused up front, so a client finds out before paying.</p></details>
+  </div>
+</div></section>
+
+<section class="sec"><div class="w"><div class="closing">
+  <div><h2 class="big">Hire across languages without guessing.</h2><p>Escrow the fee, name the terms, and let consensus check the work.</p></div>
+  <a class="btn" href="#post" data-open-post>Post a job</a>
+</div></div></section>
 </main>
 
 <script type="module">
@@ -92,8 +128,6 @@ const when = (ts) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { dateStyl
 const addr = (a) => `<a class="mono" href="${EXPLORER}/address/${esc(a)}">${short(a)}</a>${me && a.toLowerCase() === me.toLowerCase() ? " (you)" : ""}`;
 const sha256 = async (buf) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
 const cls = { OPEN: "", PAID: "ok", REFUNDED: "bad" };
-$("#contract-link").href = `${EXPLORER}/address/${ADDR}`;
-$("#contract-link").textContent = `Contract ${short(ADDR)} ↗`;
 
 async function load(openId) {
   try {
@@ -201,6 +235,10 @@ async function fill(input, url) {
   status(h ? "Hash filled from your browser." : "Could not read the page from the browser (blocked by the site). Hash it with curl.", !h);
 }
 
+const pick = (id) => { history.replaceState(null, "", `#job-${id}`); open(id).then(() => $("#detail").scrollIntoView({ behavior: "smooth" })); };
+document.querySelector("[data-show]").addEventListener("click", (e) => { e.preventDefault(); pick(Number(e.currentTarget.dataset.show)); });
+document.querySelectorAll('a[href="#post"]').forEach((a) => a.addEventListener("click", () => { $("#post details").open = true; }));
+addEventListener("scroll", () => $("#nav").classList.toggle("scrolled", scrollY > 8), { passive: true });
 $("#jobs").addEventListener("click", (e) => { const t = e.target.closest(".item[data-id]"); if (t) { e.preventDefault(); history.replaceState(null, "", `#job-${t.dataset.id}`); open(Number(t.dataset.id)); $("#detail").scrollIntoView({ behavior: "smooth" }); } });
 $("#detail").addEventListener("click", async (e) => {
   const fn = e.target.dataset?.act;
@@ -233,10 +271,8 @@ $("#create").addEventListener("submit", async (e) => {
 wireWallet((a) => { me = a; if (view.id !== null) show(); });
 load();
 </script>
-
-<footer><div class="w"><span>Built on <a href="https://genlayer.com">GenLayer</a></span><a href="https://github.com/cris-the-dev/genlayer-faithfulpay">Source</a></div></footer>
-<script>
-document.getElementById("sites").innerHTML=[["ProofBounty","proofbounty"],["ProofBounty v2","proofbounty-v2"],["IC Security Audit","ic-security-audit"],["Oracle Kit","oracle-kit"],["Workshop","workshop"],["Security Docs","docs-security"],["Rainfall Insurance","rainfall-insurance"],["DealCourt","dealcourt"],["GoalStake","goalstake"],["MandateGuard","mandateguard"],["SLA Bond","slabond"],["Attest","attest"],["SponsorPay","sponsorpay"],["ModCourt","modcourt"],["CorrectionDesk","correctiondesk"],["FaithfulPay","faithfulpay"]]
- .map(([n,s])=>`<a href="https://${s}.cristhedev.com"${s==="faithfulpay"?' aria-current="page"':""}>${n}</a>`).join("");
-</script>
+<footer><div class="w">
+  <a class="brand" href="#top"><svg viewBox="0 0 64 64" aria-hidden="true"><use href="logo.svg#m"/></svg><span>Faithful<em>Pay</em></span></a>
+  <nav><a href="https://github.com/cris-the-dev/genlayer-faithfulpay#readme">Docs</a><a href="https://github.com/cris-the-dev/genlayer-faithfulpay">GitHub</a><a href="https://explorer-bradbury.genlayer.com/address/0xBB122Fc6Ca64Dcfa9759bEFfd1C912cA7f9E72bb">Contract 0xBB12…72bb</a><a href="https://genlayer.com">Built on GenLayer</a></nav>
+</div></footer>
 </body></html>
