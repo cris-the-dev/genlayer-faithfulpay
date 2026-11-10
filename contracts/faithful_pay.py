@@ -3,24 +3,28 @@
 """
 FaithfulPay — translation escrow released when validators agree it is faithful.
 
-A client escrows the fee for one translation: the source URL and its sha256,
-the target language, the terms the translation must use, the translator and
-a deadline. Validators fetch the source at creation, so a job only exists for
-a source that is reachable, pinned and short enough to be judged whole.
+A client escrows the fee for a document of 1-10 sections: each section is a
+source URL and its sha256. The fee is split equally between sections. The
+client names a translator, or leaves the job open: translators apply and the
+client assigns one of them, seeing each applicant's record. Validators fetch
+every source at posting, so a job only exists for sources that are reachable,
+pinned and short enough to be judged whole.
 
-The translator submits a URL and the sha256 of the translation. Validators
-fetch both pages, check both hashes, check the required terms by text (no
-AI), and agree on three questions: is anything left out, is anything
+The translator submits a URL and the sha256 of one section's translation.
+Validators fetch both pages, check both hashes, check the required terms by
+text (no AI), and agree on three questions: is anything left out, is anything
 mistranslated, is it in the target language? They must agree on the exact
 list of issues, a fixed set of codes:
 
     omission  mistranslation  wrong_language  missing_term:<n>
 
-No issues: the translator is paid and the translation's hash is stored on the
-job. Otherwise the issues are recorded for the translator to fix, up to three
-attempts. A fetch failure or hash mismatch reverts and counts as no attempt.
-After the third rejected attempt, or after the deadline, anyone can refund the
-client; the translator can decline the job at any time, which also refunds it.
+No issues: that section's share is paid and its translation's hash stored.
+Otherwise the issues are recorded for the translator to fix, up to three
+attempts per section. A fetch failure or hash mismatch reverts and counts as
+no attempt. A section out of attempts, and after the deadline every unpaid
+section, can be refunded to the client by anyone; the translator can decline
+the rest of the job at any time, and the client can cancel a job nobody has
+been assigned to. Sections already paid stay paid.
 """
 
 import hashlib
@@ -45,7 +49,11 @@ MAX_TEXT = 12_000  # characters of a page's text; a longer page is refused, neve
 MAX_NOTE = 300
 MAX_ATTEMPTS = 3  # one submission and two resubmissions
 DAY = 86_400
-OPEN, PAID, REFUNDED = "OPEN", "PAID", "REFUNDED"
+MAX_SECTIONS = 10
+MAX_APPLICANTS = 20
+# Job: OPEN (taking applications), ASSIGNED, DONE (every section paid or refunded),
+# REFUNDED (cancelled or declined before anything was paid). Section: OPEN, PAID, REFUNDED.
+OPEN, ASSIGNED, DONE, PAID, REFUNDED = "OPEN", "ASSIGNED", "DONE", "PAID", "REFUNDED"
 LLM_ISSUES = ("omission", "mistranslation", "wrong_language")
 # Transfer results on Testnet Bradbury (Phase 2): every payout is an external
 # message. When the paying transaction finalizes, the consensus contract runs
@@ -67,11 +75,13 @@ T_MSG_FAILED = (  # messages contract: (tx, msgId) whose value call failed
 GEN_FINALIZED = 7
 GEN_RETURNED = 1  # txExecutionResult: FINISHED_WITH_RETURN
 # Each payout kind is created by exactly one method, which sends one transfer.
-# The payout's ref is that method's first argument (the job id; 0 for recover).
-PAYING = {"paid": "submit", "rejected": "refund", "expired": "refund", "declined": "decline", "recover": "recover"}
+# The payout's ref is that method's first argument (the section id for "paid",
+# the job id otherwise; 0 for recover).
+PAYING = {"paid": "submit", "refund": "refund", "declined": "decline", "cancelled": "cancel", "recover": "recover"}
 TX_RE = re.compile(r"^0x[0-9a-f]{64}$")
 URL_RE = re.compile(r"^https?://[^\s]{3,300}$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+ZERO = Address("0x" + "00" * 20)
 SENT = "SENT"
 DELIVERED = "DELIVERED"
 FAILED = "FAILED"
@@ -82,18 +92,31 @@ FAILED = "FAILED"
 class Job:
     id: u256
     client: Address
-    translator: Address
+    translator: Address  # zero while the job is OPEN for applications
+    language: str
+    terms: str  # JSON list of terms a section's translation must contain when its source does
+    amount: u256
+    share: u256  # per section
+    first_section: u256
+    sections: u256
+    applicants: str  # JSON list of addresses, while OPEN
+    days: u256  # time allowed once assigned
+    deadline: u256  # 0 until assigned
+    status: str
+    at: u256
+
+
+@allow_storage
+@dataclass
+class Section:
+    id: u256
+    job_id: u256
     source_url: str
     source_sha256: str
-    language: str
-    terms: str  # JSON list of terms the translation must contain
-    amount: u256
-    deadline: u256
     status: str  # OPEN, PAID, REFUNDED
     attempts: u256
     translation_url: str  # the paid translation
     translation_sha256: str
-    at: u256
 
 
 @allow_storage
@@ -101,6 +124,7 @@ class Job:
 class Submission:
     id: u256
     job_id: u256
+    section_id: u256
     url: str
     sha256: str
     issues: str  # JSON list of issue codes (what consensus decided); [] = accepted
@@ -113,8 +137,8 @@ class Submission:
 class Payout:
     to: Address
     amount: u256
-    kind: str  # "paid", "rejected", "expired", "declined", "recover"
-    ref: u256  # job id; 0 for recover
+    kind: str  # "paid", "refund", "declined", "cancelled", "recover"
+    ref: u256  # section id for "paid", job id otherwise; 0 for recover
     status: str  # SENT, DELIVERED or FAILED
     sender: Address  # who sent the paying transaction
     at: u256  # its creation time: (sender, at) identifies the paying transaction
@@ -130,7 +154,7 @@ class _Payee:
 
 # Indexed args are declared alphabetically: the SDK binds them in sorted order.
 class Submitted(gl.chain.Event):
-    def __init__(self, job_id: u256, submission_id: u256, /, **blob): ...
+    def __init__(self, job_id: u256, section_id: u256, /, **blob): ...
 
 
 def _now() -> int:
@@ -185,16 +209,17 @@ def _page(url: str, sha: str, what: str) -> str:
     return t
 
 
-def _source_ok(p: dict) -> int:
-    return len(_page(p["source_url"], p["source_sha256"], "source"))
+def _sources_ok(p: dict) -> list:
+    return [len(_page(u, h, f"source {i}")) for i, (u, h) in enumerate(zip(p["urls"], p["shas"]))]
 
 
 def _check(p: dict) -> dict:
     """Issues with one translation. `p`: source_url, source_sha256, url, sha256, language, terms."""
     source = _page(p["source_url"], p["source_sha256"], "source")
     target = _page(p["url"], p["sha256"], "translation")
-    have = _norm(target)
-    issues = [f"missing_term:{i}" for i, t in enumerate(p["terms"]) if _norm(t) not in have]
+    # A term is required in the sections whose source contains it (names, figures kept as written).
+    need, have = _norm(source), _norm(target)
+    issues = [f"missing_term:{i}" for i, t in enumerate(p["terms"]) if _norm(t) in need and _norm(t) not in have]
     terms = "\n".join(f"- {_fence(t)}" for t in p["terms"]) or "(none)"
     prompt = f"""You check whether a translation is faithful to its source.
 
@@ -214,7 +239,9 @@ THE TRANSLATION:
 {_fence(target)}
 >>>
 
-Answer three questions about the translation as a whole:
+First go through the source sentence by sentence and find each one's counterpart in the
+translation. List in "missing" every source sentence (quoted briefly) whose content has no
+counterpart. Then answer three questions about the translation as a whole:
 - "omission": is any sentence, fact, number, name or condition of the source missing?
   Rewording, merging sentences or natural reordering is not an omission.
 - "mistranslation": does any part say something different from the source (a wrong
@@ -223,11 +250,14 @@ Answer three questions about the translation as a whole:
 Answer false unless you can point to the problem.
 
 Respond with ONLY JSON:
-{{"omission": true or false, "mistranslation": true or false, "wrong_language": true or false,
+{{"missing": ["…"], "omission": true or false, "mistranslation": true or false, "wrong_language": true or false,
   "note": "one sentence naming the problems found, or confirming none"}}"""
     out = gl.nondet.exec_prompt(prompt, response_format="json")
     if not isinstance(out, dict) or not all(isinstance(out.get(k), bool) for k in LLM_ISSUES):
         raise gl.vm.UserError(f"{ERR_LLM} expected booleans {', '.join(LLM_ISSUES)}")
+    # A sentence listed as missing is an omission even if the boolean says otherwise.
+    if isinstance(out.get("missing"), list) and any(str(m).strip() for m in out["missing"]):
+        out["omission"] = True
     return {"issues": [k for k in LLM_ISSUES if out[k]] + issues, "note": str(out.get("note", ""))[:MAX_NOTE]}
 
 
@@ -351,8 +381,9 @@ def _transfer_result(q: dict) -> str:
 
 class FaithfulPay(gl.contract.Contract):
     jobs: DynArray[Job]
+    sections: DynArray[Section]
     submissions: DynArray[Submission]
-    stats: TreeMap[str, u256]  # "0xaddr:paid|rejected" for translators
+    stats: TreeMap[str, u256]  # "0xaddr:paid|rejected" for translators, counted per section
     payouts: DynArray[Payout]
     payout_keys: TreeMap[str, u256]  # "sender:at" -> payout id, one per transaction
     settled_txs: TreeMap[str, u256]  # paying transaction -> payout id
@@ -365,16 +396,30 @@ class FaithfulPay(gl.contract.Contract):
     # ── Client ───────────────────────────────────────────────────────────────
 
     @gl.public.write.payable
-    def create_job(self, translator: str, source_url: str, source_sha256: str, language: str, terms_json: str, days: int) -> int:
-        """The value sent is the fee, paid to the translator for a faithful translation.
-        Validators fetch the source now: it must match its sha256 and be short enough to judge."""
-        source_url, source_sha256, language = source_url.strip(), source_sha256.strip().lower(), language.strip()
-        if int(gl.message.value) <= 0:
-            raise gl.vm.UserError(f"{ERR_EXPECTED} send the translation fee")
-        if not URL_RE.match(source_url):
+    def create_job(self, translator: str, sources_json: str, language: str, terms_json: str, days: int) -> int:
+        """The value sent is the fee, split equally between the sections. `sources_json` is a
+        JSON list of [url, sha256], one per section. `translator` "" opens the job for
+        applications. Validators fetch every source now: each must match its sha256 and be
+        short enough to judge. `days` start when the translator is assigned."""
+        language = language.strip()
+        try:
+            src = json.loads(sources_json)
+        except Exception:
+            src = None
+        if not isinstance(src, list) or not (1 <= len(src) <= MAX_SECTIONS) or not all(
+            isinstance(x, list) and len(x) == 2 and all(isinstance(y, str) for y in x) for x in src
+        ):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} sources must be a JSON list of 1-{MAX_SECTIONS} [url, sha256]")
+        urls, shas = [u.strip() for u, _ in src], [h.strip().lower() for _, h in src]
+        if not all(URL_RE.match(u) for u in urls):
             raise gl.vm.UserError(f"{ERR_EXPECTED} source must be an http(s) url, at most 300 characters")
-        if not SHA_RE.match(source_sha256):
+        if not all(SHA_RE.match(h) for h in shas):
             raise gl.vm.UserError(f"{ERR_EXPECTED} sha256 must be 64 hex characters")
+        if len(set(urls)) != len(urls):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} each section needs its own source url")
+        fee, n = int(gl.message.value), len(urls)
+        if fee <= 0 or fee % n:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} send a fee that splits equally between {n} sections")
         if not (2 <= len(language) <= 40):
             raise gl.vm.UserError(f"{ERR_EXPECTED} language must be 2-40 characters")
         if not (1 <= days <= 90):
@@ -385,39 +430,45 @@ class FaithfulPay(gl.contract.Contract):
             terms = None
         if not isinstance(terms, list) or len(terms) > 20 or not all(isinstance(t, str) and 1 <= len(t.strip()) <= 80 for t in terms):
             raise gl.vm.UserError(f"{ERR_EXPECTED} terms must be a JSON list of at most 20 strings of 1-80 characters")
-        me, who = gl.message.sender_address, Address(translator)
+        me = gl.message.sender_address
+        who = Address(translator.strip()) if translator.strip() else None
         if who == me:
             raise gl.vm.UserError(f"{ERR_EXPECTED} the translator must be someone else")
-        p = {"source_url": source_url, "source_sha256": source_sha256}
+        p = {"urls": urls, "shas": shas}
 
-        def leader_fn() -> int:
-            return _source_ok(p)
+        def leader_fn() -> list:
+            return _sources_ok(p)
 
         def validator_fn(res) -> bool:
             if not isinstance(res, gl.vm.Return):
-                return _agree_on_error(res, p, _source_ok)
+                return _agree_on_error(res, p, _sources_ok)
             try:
-                return res.calldata == _source_ok(p)
+                return res.calldata == _sources_ok(p)
             except Exception:
                 return False
 
         gl.vm.run_nondet(leader_fn, validator_fn)
-        jid, now = len(self.jobs), _now()
+        jid, now, first = len(self.jobs), _now(), len(self.sections)
+        for i in range(n):
+            self.sections.append(
+                Section(id=u256(first + i), job_id=u256(jid), source_url=urls[i], source_sha256=shas[i],
+                        status=OPEN, attempts=u256(0), translation_url="", translation_sha256="")
+            )
         self.jobs.append(
             Job(
                 id=u256(jid),
                 client=me,
-                translator=who,
-                source_url=source_url,
-                source_sha256=source_sha256,
+                translator=who or ZERO,
                 language=language,
                 terms=json.dumps([" ".join(t.split()) for t in terms], ensure_ascii=False),
                 amount=gl.message.value,
-                deadline=u256(now + days * DAY),
-                status=OPEN,
-                attempts=u256(0),
-                translation_url="",
-                translation_sha256="",
+                share=u256(fee // n),
+                first_section=u256(first),
+                sections=u256(n),
+                applicants="[]",
+                days=u256(days),
+                deadline=u256(now + days * DAY if who else 0),
+                status=ASSIGNED if who else OPEN,
                 at=u256(now),
             )
         )
@@ -425,43 +476,92 @@ class FaithfulPay(gl.contract.Contract):
         return jid
 
     @gl.public.write
-    def refund(self, job_id: int) -> None:
-        """After the last rejected attempt or the deadline, the fee goes back to the client (anyone may call)."""
-        j = self._open(job_id)
-        if int(j.attempts) >= MAX_ATTEMPTS:
-            self._close(j, REFUNDED, "rejected")
-        elif _now() > int(j.deadline):
-            self._close(j, REFUNDED, "expired")
-        else:
-            raise gl.vm.UserError(f"{ERR_EXPECTED} attempts left and the deadline has not passed")
+    def assign(self, job_id: int, translator: str) -> None:
+        """The client picks one applicant; the deadline starts now."""
+        j = self._status(job_id, OPEN)
+        if gl.message.sender_address != j.client:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} not authorised")
+        who = Address(translator)
+        if who.as_hex.lower() not in json.loads(j.applicants):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} that address has not applied")
+        j.translator, j.status, j.applicants = who, ASSIGNED, "[]"
+        j.deadline = u256(_now() + int(j.days) * DAY)
+
+    @gl.public.write
+    def cancel(self, job_id: int) -> None:
+        """While nobody is assigned, the client takes the whole fee back."""
+        j = self._status(job_id, OPEN)
+        if gl.message.sender_address != j.client:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} not authorised")
+        self._close(j, [s for s in self._sections(j) if s.status == OPEN], "cancelled", REFUNDED)
+
+    @gl.public.write
+    def refund(self, job_id: int) -> int:
+        """Unpaid sections go back to the client (anyone may call): a section out of
+        attempts at once, every unpaid section after the deadline. Returns the amount."""
+        j = self._status(job_id, ASSIGNED)
+        late = _now() > int(j.deadline)
+        due = [s for s in self._sections(j) if s.status == OPEN and (late or int(s.attempts) >= MAX_ATTEMPTS)]
+        if not due:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} nothing to refund: attempts left and the deadline has not passed")
+        for s in due:
+            if int(s.attempts) >= MAX_ATTEMPTS:
+                self._stat(j.translator, "rejected")
+        return self._close(j, due, "refund", REFUNDED)
 
     # ── Translator ───────────────────────────────────────────────────────────
 
     @gl.public.write
-    def decline(self, job_id: int) -> None:
-        j = self._open(job_id)
-        if gl.message.sender_address != j.translator:
-            raise gl.vm.UserError(f"{ERR_EXPECTED} not authorised")
-        self._close(j, REFUNDED, "declined")
+    def apply(self, job_id: int) -> None:
+        j = self._status(job_id, OPEN)
+        me = gl.message.sender_address.as_hex.lower()
+        a = json.loads(j.applicants)
+        if me == j.client.as_hex.lower():
+            raise gl.vm.UserError(f"{ERR_EXPECTED} the translator must be someone else")
+        if me in a:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} already applied")
+        if len(a) >= MAX_APPLICANTS:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} the job has {MAX_APPLICANTS} applicants")
+        j.applicants = json.dumps(a + [me])
 
     @gl.public.write
-    def submit(self, job_id: int, url: str, sha256: str) -> list:
-        """Returns the issues found; [] means accepted and paid. Pays only the translator."""
-        j = self._open(job_id)
+    def withdraw_application(self, job_id: int) -> None:
+        j = self._status(job_id, OPEN)
+        me = gl.message.sender_address.as_hex.lower()
+        a = json.loads(j.applicants)
+        if me not in a:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} not an applicant")
+        j.applicants = json.dumps([x for x in a if x != me])
+
+    @gl.public.write
+    def decline(self, job_id: int) -> int:
+        """The translator gives up the unpaid sections; paid ones stay paid. Returns the refund."""
+        j = self._status(job_id, ASSIGNED)
+        if gl.message.sender_address != j.translator:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} not authorised")
+        return self._close(j, [s for s in self._sections(j) if s.status == OPEN], "declined", REFUNDED)
+
+    @gl.public.write
+    def submit(self, section_id: int, url: str, sha256: str) -> list:
+        """Returns the issues found; [] means accepted and the section's share paid. Pays only the translator."""
+        s = self._section(section_id)
+        j = self._status(int(s.job_id), ASSIGNED)
         url, sha256 = url.strip(), sha256.strip().lower()
         if gl.message.sender_address != j.translator:
             raise gl.vm.UserError(f"{ERR_EXPECTED} not authorised")
+        if s.status != OPEN:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} section is {s.status}")
         if _now() > int(j.deadline):
             raise gl.vm.UserError(f"{ERR_EXPECTED} the deadline has passed")
-        if int(j.attempts) >= MAX_ATTEMPTS:
+        if int(s.attempts) >= MAX_ATTEMPTS:
             raise gl.vm.UserError(f"{ERR_EXPECTED} no attempts left")
-        if not URL_RE.match(url) or url == j.source_url:
+        if not URL_RE.match(url) or url == s.source_url:
             raise gl.vm.UserError(f"{ERR_EXPECTED} translation must be another http(s) url")
         if not SHA_RE.match(sha256):
             raise gl.vm.UserError(f"{ERR_EXPECTED} sha256 must be 64 hex characters")
         p = {
-            "source_url": j.source_url,
-            "source_sha256": j.source_sha256,
+            "source_url": s.source_url,
+            "source_sha256": s.source_sha256,
             "url": url,
             "sha256": sha256,
             "language": j.language,
@@ -480,7 +580,8 @@ class FaithfulPay(gl.contract.Contract):
         self.submissions.append(
             Submission(
                 id=u256(sid),
-                job_id=u256(job_id),
+                job_id=s.job_id,
+                section_id=u256(section_id),
                 url=url,
                 sha256=sha256,
                 issues=json.dumps(issues),
@@ -488,11 +589,13 @@ class FaithfulPay(gl.contract.Contract):
                 at=u256(_now()),
             )
         )
-        j.attempts = _add(j.attempts, 1)
-        Submitted(u256(job_id), u256(sid), accepted=not issues).emit()
+        s.attempts = _add(s.attempts, 1)
+        Submitted(s.job_id, u256(section_id), submission=u256(sid), accepted=not issues).emit()
         if not issues:
-            j.translation_url, j.translation_sha256 = url, sha256
-            self._close(j, PAID, "paid")
+            self._pay(j.translator, int(j.share), "paid", section_id)  # pays first: nothing changes if it cannot be sent
+            s.status, s.translation_url, s.translation_sha256 = PAID, url, sha256
+            self._stat(j.translator, "paid")
+            self._finish(j)
         return issues
 
     # ── Payouts ──────────────────────────────────────────────────────────────
@@ -564,22 +667,23 @@ class FaithfulPay(gl.contract.Contract):
     @gl.public.view
     def get_job(self, job_id: int) -> dict:
         j = self._j(job_id)
+        secs = [self._section_view(j, x) for x in self._sections(j)]
         return {
             "id": int(j.id),
             "client": j.client.as_hex,
-            "translator": j.translator.as_hex,
-            "source_url": j.source_url,
-            "source_sha256": j.source_sha256,
+            "translator": j.translator.as_hex if j.status != OPEN else None,
             "language": j.language,
             "terms": json.loads(j.terms),
             "amount": int(j.amount),
+            "share": int(j.share),
+            "paid": int(j.share) * sum(x["status"] == PAID for x in secs),
+            "refunded": int(j.share) * sum(x["status"] == REFUNDED for x in secs),
+            "applicants": [{"address": a, **self.get_translator(a)} for a in json.loads(j.applicants)],
+            "days": int(j.days),
             "deadline": int(j.deadline),
             "status": j.status,
-            "attempts": int(j.attempts),
-            "attempts_left": max(0, MAX_ATTEMPTS - int(j.attempts)) if j.status == OPEN else 0,
-            "refundable": j.status == OPEN and (int(j.attempts) >= MAX_ATTEMPTS or _now() > int(j.deadline)),
-            "translation_url": j.translation_url,
-            "translation_sha256": j.translation_sha256,
+            "refundable": j.status == ASSIGNED and any(x["refundable"] for x in secs),
+            "sections": secs,
             "at": int(j.at),
         }
 
@@ -597,6 +701,7 @@ class FaithfulPay(gl.contract.Contract):
         return {
             "id": int(s.id),
             "job_id": int(s.job_id),
+            "section_id": int(s.section_id),
             "url": s.url,
             "sha256": s.sha256,
             "issues": json.loads(s.issues),
@@ -670,20 +775,51 @@ class FaithfulPay(gl.contract.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED} job not found")
         return self.jobs[job_id]
 
-    def _open(self, job_id: int) -> Job:
+    def _status(self, job_id: int, status: str) -> Job:
         j = self._j(job_id)
-        if j.status != OPEN:
+        if j.status != status:
             raise gl.vm.UserError(f"{ERR_EXPECTED} job is {j.status}")
         return j
 
-    def _close(self, j: Job, status: str, kind: str) -> None:
-        """Pays the fee out (to the translator if PAID, else back to the client) and closes the job."""
-        to = j.translator if status == PAID else j.client
-        self._pay(to, int(j.amount), kind, int(j.id))
-        j.status = status
-        if kind in ("paid", "rejected"):
-            key = f"{j.translator.as_hex.lower()}:{kind}"
-            self.stats[key] = _add(self.stats.get(key, u256(0)), 1)
+    def _section(self, section_id: int) -> Section:
+        if section_id < 0 or section_id >= len(self.sections):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} section not found")
+        return self.sections[section_id]
+
+    def _sections(self, j: Job) -> list:
+        return [self.sections[i] for i in range(int(j.first_section), int(j.first_section) + int(j.sections))]
+
+    def _section_view(self, j: Job, s: Section) -> dict:
+        late = j.status == ASSIGNED and _now() > int(j.deadline)
+        return {
+            "id": int(s.id),
+            "source_url": s.source_url,
+            "source_sha256": s.source_sha256,
+            "status": s.status,
+            "attempts": int(s.attempts),
+            "attempts_left": max(0, MAX_ATTEMPTS - int(s.attempts)) if s.status == OPEN and j.status == ASSIGNED and not late else 0,
+            "refundable": j.status == ASSIGNED and s.status == OPEN and (late or int(s.attempts) >= MAX_ATTEMPTS),
+            "translation_url": s.translation_url,
+            "translation_sha256": s.translation_sha256,
+        }
+
+    def _stat(self, who: Address, kind: str) -> None:
+        key = f"{who.as_hex.lower()}:{kind}"
+        self.stats[key] = _add(self.stats.get(key, u256(0)), 1)
+
+    def _close(self, j: Job, secs: list, kind: str, status: str) -> int:
+        """One transfer to the client for the unpaid sections `secs`, which become `status`."""
+        amount = int(j.share) * len(secs)
+        self._pay(j.client, amount, kind, int(j.id))  # pays first: nothing changes if it cannot be sent
+        for s in secs:
+            s.status = status
+        self._finish(j)
+        return amount
+
+    def _finish(self, j: Job) -> None:
+        secs = self._sections(j)
+        if all(s.status != OPEN for s in secs):
+            j.status = REFUNDED if all(s.status == REFUNDED for s in secs) else DONE
 
     def _pay(self, to: Address, amount: int, kind: str, ref: int) -> int:
         if int(self.balance) < amount:

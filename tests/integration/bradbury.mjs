@@ -2,24 +2,26 @@
 //
 //   python deploy/shrink.py contracts/faithful_pay.py build/faithful_pay.py --pack
 //   npm i genlayer-js@2.0.0-rc.2   # plus the estimateTransactionFees patch in app/README.md
-//   GL_PK0=0x... GL_PK1=0x... node tests/integration/bradbury.mjs build/faithful_pay.py [contract]
+//   GL_PK0=0x... GL_PK1=0x... GL_PK2=0x... node tests/integration/bradbury.mjs build/faithful_pay.py [contract]
 //
-// GL_PK0 is the client (evidence/notice.html, hosted at EVIDENCE); GL_PK1 translates it into
-// Vietnamese. A source that differs from its hash and a job for oneself are rejected; the client
-// cannot submit for the translator; a draft missing a paragraph is rejected with an omission and
-// nothing paid; a translation changed after it was hashed reverts and uses no attempt; the fixed
-// translation is paid and its hash stored; a paid job takes no more submissions. A second job is
-// declined by the translator (not by the client), refunding the client. Both payouts settle from
-// their own transfers. Every transaction carries a fee deposit; a paying one also allocates its
-// payout's gas.
+// GL_PK0 is the client (evidence/notice*.html, hosted at EVIDENCE); GL_PK1 translates into
+// Vietnamese; GL_PK2 is a second applicant. Job 1 has two sections: a stale source hash, a job for
+// oneself and a fee that does not split are rejected; the client cannot submit; a draft missing a
+// paragraph is rejected on section 1 and nothing paid; a changed page reverts and uses no attempt;
+// each section is paid on its own when it passes, and the job is DONE. Job 2 is open: the client
+// cannot apply, two translators apply, one withdraws, only the client assigns, the assigned
+// translator declines and the client is refunded. Job 3 is open and cancelled by the client. Every
+// payout settles from its own transfer. Every transaction carries a fee deposit; a paying one also
+// allocates its payout's gas.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createAccount, createClient, MessageType, encodeExternalMessageFeeParams } from "genlayer-js";
 import { testnetBradbury } from "genlayer-js/chains";
 
-const FEE = 10n ** 15n, SMALL = 10n ** 14n;
+const SHARE = 5n * 10n ** 14n, SMALL = 10n ** 14n;
 const EVIDENCE = "https://faithfulpay.cristhedev.com/evidence/";
 const SOURCE = EVIDENCE + "notice.html", GOOD = EVIDENCE + "notice-vi.html", DRAFT = EVIDENCE + "notice-vi-draft.html", EDITED = EVIDENCE + "notice-vi-edited.html";
+const SOURCE2 = EVIDENCE + "notice-2.html", GOOD2 = EVIDENCE + "notice-2-vi.html";
 const TERMS = JSON.stringify(["Hill Street", "20"]);
 const CONSENSUS_MAIN = "0x2e2766cbc3e5e61ce93bbcdcbb3eacb82082a019";
 const T_FINALIZED = "0x24196ec40f90671b7144e716978686b4f3c7d6b00b23da3971ef2b52af27d87f";
@@ -28,8 +30,10 @@ const PAYOUT_GAS = 100000n, PAYOUT_GAS_PRICE = 1000000000n;
 const endpoint = "https://rpc-bradbury.genlayer.com";
 const a0 = createAccount(process.env.GL_PK0);
 const a1 = createAccount(process.env.GL_PK1);
+const a2 = createAccount(process.env.GL_PK2);
 const c0 = createClient({ chain: testnetBradbury, endpoint, account: a0 });
 const c1 = createClient({ chain: testnetBradbury, endpoint, account: a1 });
+const c2 = createClient({ chain: testnetBradbury, endpoint, account: a2 });
 const sha = (t) => createHash("sha256").update(t).digest("hex");
 const page = async (url) => sha(Buffer.from(await (await fetch(url)).arrayBuffer()));
 const fees = async (c, payee) => {
@@ -37,7 +41,12 @@ const fees = async (c, payee) => {
     messageType: MessageType.External, onAcceptance: false, recipient: payee, budget: PAYOUT_GAS * PAYOUT_GAS_PRICE,
     callKey: "0x" + "00".repeat(32), feeParams: encodeExternalMessageFeeParams({ gasLimit: PAYOUT_GAS, maxGasPrice: PAYOUT_GAS_PRICE }),
   }];
-  const e = await c.estimateTransactionFees(payee ? { messageAllocations } : {});
+  // A read, so retrying a dropped connection is safe.
+  let e;
+  for (let i = 0; !e; i++) {
+    try { e = await c.estimateTransactionFees(payee ? { messageAllocations } : {}); }
+    catch (err) { if (i >= 5 || !/fetch failed|ECONNRESET|timed out|socket/i.test(String(err?.details ?? err?.message))) throw err; await new Promise((r) => setTimeout(r, 10000)); }
+  }
   return { distribution: e.distribution, feeValue: e.feeValue, ...(payee && { messageAllocations: e.messageAllocations }) };
 };
 // The public RPC drops connections now and then; retry the wait, never the write.
@@ -83,9 +92,14 @@ async function settled(fn, args, ok) {
     await new Promise((r) => setTimeout(r, 10000));
   }
 }
+// Reads only, so retrying a dropped connection is safe.
 const rpc = async (method, params) => {
-  const r = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json", "user-agent": "faithfulpay-e2e" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
-  return (await r.json()).result;
+  for (let i = 0; ; i++) {
+    try {
+      const r = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json", "user-agent": "faithfulpay-e2e" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      return (await r.json()).result;
+    } catch (e) { if (i >= 5) throw e; await new Promise((r) => setTimeout(r, 10000)); }
+  }
 };
 // The consensus-layer transaction that finalized `hash`: it emits TransactionFinalized(txId).
 async function finalizeTx(hash, fromBlock) {
@@ -118,50 +132,71 @@ if (!address) {
 }
 const fromBlock = BigInt(await rpc("eth_blockNumber", []));
 stray = BigInt((await read("get_accounting")).unaccounted);
-const [sSha, gSha, dSha] = [await page(SOURCE), await page(GOOD), await page(DRAFT)];
-check(sha(Buffer.from(await (await fetch(EDITED)).arrayBuffer())) !== gSha, "the edited copy differs from the hashed translation");
-const client = a0.address, translator = a1.address;
+const [sSha, gSha, dSha, s2Sha, g2Sha] = await Promise.all([SOURCE, GOOD, DRAFT, SOURCE2, GOOD2].map(page));
+check((await page(EDITED)) !== gSha, "the edited copy differs from the hashed translation");
+const client = a0.address, translator = a1.address, other = a2.address, low = (x) => x?.toLowerCase();
 const jid = Number((await read("get_jobs", [0, 1])).total);
+const both = JSON.stringify([[SOURCE, sSha], [SOURCE2, s2Sha]]);
 
-// Jobs: the source must match its hash; the translator must be someone else.
-await fails("a source that differs from its hash is rejected", c0, "create with a stale source hash", "create_job", [translator, SOURCE, "0".repeat(64), "Vietnamese", TERMS, 1], { value: FEE });
-await fails("the translator must be someone else", c0, "create for oneself", "create_job", [client, SOURCE, sSha, "Vietnamese", TERMS, 1], { value: FEE });
-await ok(c0, "create_job", "create_job", [translator, SOURCE, sSha, "Vietnamese", TERMS, 1], { value: FEE });
-let j = await settled("get_job", [jid], (x) => x.status === "OPEN");
-check(j.translator.toLowerCase() === translator.toLowerCase() && BigInt(j.amount) === FEE && j.source_sha256 === sSha, "job escrows the fee, source pinned");
+// Job 1, two sections: every source must match its hash; the translator must be someone else; the fee splits.
+await fails("a source that differs from its hash is rejected", c0, "create with a stale hash on section 2", "create_job", [translator, JSON.stringify([[SOURCE, sSha], [SOURCE2, "0".repeat(64)]]), "Vietnamese", TERMS, 1], { value: 2n * SHARE });
+await fails("the translator must be someone else", c0, "create for oneself", "create_job", [client, both, "Vietnamese", TERMS, 1], { value: 2n * SHARE });
+await fails("a fee that does not split equally is rejected", c0, "create with an odd fee", "create_job", [translator, both, "Vietnamese", TERMS, 1], { value: 2n * SHARE + 1n });
+await ok(c0, "create_job (2 sections)", "create_job", [translator, both, "Vietnamese", TERMS, 1], { value: 2n * SHARE });
+let j = await settled("get_job", [jid], (x) => x.status === "ASSIGNED");
+const [s0, s1] = j.sections.map((x) => Number(x.id));
+check(low(j.translator) === low(translator) && BigInt(j.amount) === 2n * SHARE && BigInt(j.share) === SHARE && j.sections[1].source_sha256 === s2Sha, "job escrows the fee, 2 sections pinned");
 
-// Submissions: a draft with a missing paragraph is rejected, nothing paid.
-await fails("only the translator submits", c0, "submit by the client", "submit", [jid, GOOD, gSha], { payee: translator });
-await ok(c1, "submit the draft", "submit", [jid, DRAFT, dSha], { payee: translator });
-j = await settled("get_job", [jid], (x) => Number(x.attempts) === 1);
+// Section 1: a draft with a missing paragraph is rejected, nothing paid.
+await fails("only the translator submits", c0, "submit by the client", "submit", [s0, GOOD, gSha], { payee: translator });
+await ok(c1, "submit the draft for section 1", "submit", [s0, DRAFT, dSha], { payee: translator });
+j = await settled("get_job", [jid], (x) => Number(x.sections[0].attempts) === 1);
 let subs = (await read("get_submissions", [jid, 0, 10])).items;
-check(j.status === "OPEN" && j.attempts_left == 2 && subs[0].issues.includes("omission"), `draft rejected: ${subs[0].issues.join(", ")}; 2 attempts left`);
+check(j.sections[0].status === "OPEN" && Number(j.sections[0].attempts_left) === 2 && subs[0].issues.includes("omission") && BigInt(j.paid) === 0n, `draft rejected: ${subs[0].issues.join(", ")}; 2 attempts left`);
 console.log("    note (unverified):", subs[0].note);
 // A page that changed after it was hashed: reverts, no attempt used.
-check((await tx(c1, "submit a changed page", "submit", [jid, EDITED, gSha], { payee: translator })).txExecutionResultName !== "FINISHED_WITH_RETURN", "content changed after hashing reverts");
-check(Number((await read("get_job", [jid])).attempts) === 1, "no attempt used");
+check((await tx(c1, "submit a changed page", "submit", [s0, EDITED, gSha], { payee: translator })).txExecutionResultName !== "FINISHED_WITH_RETURN", "content changed after hashing reverts");
+check(Number((await read("get_job", [jid])).sections[0].attempts) === 1, "no attempt used");
 
-// The fixed translation is paid and pinned.
+// Each section is paid on its own.
 const pid = Number((await read("get_accounting")).payout_count);
-const paid = await ok(c1, "submit the fixed translation", "submit", [jid, GOOD, gSha], { payee: translator });
-j = await settled("get_job", [jid], (x) => x.status === "PAID");
-subs = (await read("get_submissions", [jid, 0, 10])).items;
-check(j.status === "PAID" && j.translation_sha256 === gSha && j.translation_url === GOOD && subs.length === 2 && subs[1].issues.length === 0, "PAID, translation hash stored");
-console.log("    note (unverified):", subs[1].note);
-await fails("a paid job takes no more submissions", c1, "submit again", "submit", [jid, GOOD, gSha], { payee: translator });
+const paid0 = await ok(c1, "submit the fixed section 1", "submit", [s0, GOOD, gSha], { payee: translator });
+j = await settled("get_job", [jid], (x) => x.sections[0].status === "PAID");
+check(j.status === "ASSIGNED" && BigInt(j.paid) === SHARE && j.sections[0].translation_sha256 === gSha && j.sections[1].status === "OPEN", "section 1 PAID alone, hash stored; section 2 still open");
+await fails("a paid section takes no more submissions", c1, "submit section 1 again", "submit", [s0, GOOD, gSha], { payee: translator });
+const paid1 = await ok(c1, "submit section 2", "submit", [s1, GOOD2, g2Sha], { payee: translator });
+j = await settled("get_job", [jid], (x) => x.status === "DONE");
+check(j.status === "DONE" && BigInt(j.paid) === 2n * SHARE && j.sections[1].translation_url === GOOD2, "section 2 PAID, job DONE");
 const tr = await read("get_translator", [translator]);
-check(Number(tr.paid) >= 1, `translator record: ${tr.paid} paid, ${tr.rejected} rejected`);
+check(Number(tr.paid) >= 2, `translator record: ${tr.paid} paid, ${tr.rejected} rejected`);
 
-// A second job, declined by the translator: the client is refunded.
-await ok(c0, "create a second job", "create_job", [translator, SOURCE, sSha, "Vietnamese", "[]", 1], { value: SMALL });
+// Job 2, open: applications, assignment by the client, then a decline refunds the client.
+await ok(c0, "create an open job", "create_job", ["", JSON.stringify([[SOURCE, sSha]]), "Vietnamese", "[]", 1], { value: SMALL });
+await fails("the client cannot apply", c0, "apply as the client", "apply", [jid + 1]);
+await ok(c1, "apply", "apply", [jid + 1]);
+await ok(c2, "apply (second translator)", "apply", [jid + 1]);
+await ok(c2, "withdraw_application", "withdraw_application", [jid + 1]);
+j = await settled("get_job", [jid + 1], (x) => x.applicants.length === 1);
+check(j.status === "OPEN" && j.translator === null && low(j.applicants[0].address) === low(translator) && Number(j.applicants[0].paid) >= 2, "one applicant left, with a record");
+await fails("only the client assigns", c1, "assign by the translator", "assign", [jid + 1, translator]);
+await fails("only an applicant can be assigned", c0, "assign a non-applicant", "assign", [jid + 1, other]);
+await ok(c0, "assign", "assign", [jid + 1, translator]);
+j = await settled("get_job", [jid + 1], (x) => x.status === "ASSIGNED");
+check(low(j.translator) === low(translator) && Number(j.deadline) > Number(j.at), "assigned; the deadline starts now");
 await fails("only the translator declines", c0, "decline by the client", "decline", [jid + 1], { payee: client });
 const declined = await ok(c1, "decline", "decline", [jid + 1], { payee: client });
 check((await settled("get_job", [jid + 1], (x) => x.status === "REFUNDED")).status === "REFUNDED", "declined job REFUNDED");
 
-const p0 = await read("get_payout", [pid]), p1 = await settled("get_payout", [pid + 1], (x) => x.kind === "declined");
-check(p0.kind === "paid" && BigInt(p0.amount) === FEE && p0.to.toLowerCase() === translator.toLowerCase(), `payout ${pid}: fee to the translator`);
-check(BigInt(p1.amount) === SMALL && p1.to.toLowerCase() === client.toLowerCase(), `payout ${pid + 1}: refund to the client`);
-await settle(pid, paid, fromBlock);
-await settle(pid + 1, declined, fromBlock);
+// Job 3, open, cancelled by the client before anyone is assigned.
+await ok(c0, "create a second open job", "create_job", ["", JSON.stringify([[SOURCE2, s2Sha]]), "Vietnamese", "[]", 1], { value: SMALL });
+await fails("only the client cancels", c1, "cancel by the translator", "cancel", [jid + 2], { payee: client });
+const cancelled = await ok(c0, "cancel", "cancel", [jid + 2], { payee: client });
+check((await settled("get_job", [jid + 2], (x) => x.status === "REFUNDED")).status === "REFUNDED", "cancelled job REFUNDED");
+
+const ps = [];
+for (let i = 0; i < 4; i++) ps.push(await settled("get_payout", [pid + i], (x) => !!x?.kind));
+const want = [["paid", SHARE, translator], ["paid", SHARE, translator], ["declined", SMALL, client], ["cancelled", SMALL, client]];
+want.forEach(([kind, amount, to], i) => check(ps[i].kind === kind && BigInt(ps[i].amount) === amount && low(ps[i].to) === low(to), `payout ${pid + i}: ${kind} ${amount} to ${to.slice(0, 8)}`));
+for (const [i, t] of [paid0, paid1, declined, cancelled].entries()) await settle(pid + i, t, fromBlock);
 check(BigInt((await read("get_accounting")).unaccounted) === stray, `balance matches what the contract expects to hold (+${stray} from unexecuted or reverted txs)`);
-console.log("contract", address, "jobs", jid, jid + 1);
+console.log("contract", address, "jobs", jid, jid + 1, jid + 2);

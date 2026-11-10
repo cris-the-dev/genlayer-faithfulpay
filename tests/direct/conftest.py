@@ -180,46 +180,53 @@ def tick(vm, seconds=1):
 
 
 SOURCE_URL = "https://client.example/notice.html"
+SOURCE2_URL = "https://client.example/notice-2.html"
 URL = "https://translator.example/notice-vi.html"
+URL2 = "https://translator.example/notice-2-vi.html"
 SOURCE = "<html><body><h1>Water outage</h1><p>Water will be off on Tuesday from 9:00 to 14:00.</p><p>Bring a container to the Hill Street depot.</p></body></html>"
+SOURCE2 = "<html><body><h1>After the outage</h1><p>Run the cold tap for five minutes before drinking. Hill Street depot opens at 9:00.</p></body></html>"
 GOOD = "<html><body><h1>Cắt nước</h1><p>Nước sẽ bị cắt vào thứ Ba từ 9:00 đến 14:00.</p><p>Hãy mang theo bình chứa đến <b>trạm</b> Hill Street.</p></body></html>"
+GOOD2 = "<html><body><h1>Sau khi cắt nước</h1><p>Hãy mở vòi nước lạnh năm phút trước khi uống. Trạm Hill Street mở cửa lúc 9:00.</p></body></html>"
 SHORT = "<html><body><h1>Cắt nước</h1><p>Nước sẽ bị cắt vào thứ Ba từ 9:00 đến 14:00.</p></body></html>"
 TERMS = ["Hill Street", "9:00"]
-FEE = GEN // 10
+FEE = GEN // 10  # per section
 LLM = r"whether a translation is faithful"
 
 def llm(vm, omission=False, mistranslation=False, wrong_language=False):
     vm.mock_llm(LLM, json.dumps({"omission": omission, "mistranslation": mistranslation, "wrong_language": wrong_language, "note": "checked"}))
 
-def pages(vm, translation=GOOD, source=SOURCE, status=200, **answer):
-    """Both pages and the LLM's answer, for leader and validators."""
+def pages(vm, translation=GOOD, source=SOURCE, status=200, url=URL, **answer):
+    """Both sections' pages (section 0's source as given) and the LLM's answer, for leader and validators."""
     vm.clear_mocks()
-    vm.mock_web(r"client\.example", {"status": status, "body": source})
-    vm.mock_web(r"translator\.example", {"status": 200, "body": translation})
+    vm.mock_web(r"client\.example/notice-2", {"status": 200, "body": SOURCE2})
+    vm.mock_web(r"client\.example/notice\.html", {"status": status, "body": source})
+    vm.mock_web(r"translator\.example/" + url.rsplit("/", 1)[-1].replace(".", r"\."), {"status": 200, "body": translation})
     llm(vm, **answer)
 
-def create(vm, c, client, translator, value=FEE, terms=TERMS, days=7, s_sha=None, **kw):
+def create(vm, c, client, translator, value=None, terms=TERMS, days=7, s_sha=None, sources=None, **kw):
+    """`translator` None opens the job for applications."""
     pages(vm, **kw)
-    vm.sender, vm.value = client, value
+    sources = sources if sources is not None else [[SOURCE_URL, s_sha or sha(kw.get("source", SOURCE))], [SOURCE2_URL, sha(SOURCE2)]]
+    vm.sender, vm.value = client, FEE * len(sources) if value is None else value
     try:
-        return c.create_job(to_hex(translator), SOURCE_URL, s_sha or sha(SOURCE), "Vietnamese", json.dumps(terms), days)
+        return c.create_job(to_hex(translator) if translator else "", json.dumps(sources), "Vietnamese", json.dumps(terms), days)
     finally:
         vm.value = 0
 
 @pytest.fixture
 def job(direct_vm, direct_deploy, direct_alice, direct_bob):
-    """Job 0: Alice pays FEE for Bob's translation."""
+    """Job 0, sections 0 and 1: Alice pays 2 x FEE, Bob translates."""
     direct_vm.warp("2030-01-01T10:00:00Z")
     c = direct_deploy("contracts/faithful_pay.py")
     create(direct_vm, c, direct_alice, direct_bob)
-    chain_balance(direct_vm, FEE)
+    chain_balance(direct_vm, 2 * FEE)
     return c
 
-def submit(vm, c, who, translation=GOOD, sha256=None, url=URL, **kw):
-    pages(vm, translation=translation, **kw)
+def submit(vm, c, who, translation=GOOD, sha256=None, url=URL, section=0, **kw):
+    pages(vm, translation=translation, url=url, **kw)
     vm.sender = who
     tick(vm)
-    return c.submit(0, url, sha256 or sha(translation))
+    return c.submit(section, url, sha256 or sha(translation))
 
 # ── Fake Bradbury RPC for settle_payout ─────────────────────────────────────
 

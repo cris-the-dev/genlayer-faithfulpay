@@ -59,7 +59,7 @@
       <li>Order translations into languages you can't check yourself.</li>
       <li>The fee is released only for a complete, faithful translation.</li>
       <li>Insist on product names, figures or legal terms with required terms.</li>
-      <li>Missed deadline or three failed attempts: anyone can refund you.</li>
+      <li>Missed deadline, or three failed attempts on a section: anyone can refund you what was not earned.</li>
     </ul></div>
     <div class="sheet"><h3 class="h">For translators</h3><ul>
       <li>The money is locked before you start. No chasing invoices.</li>
@@ -85,17 +85,16 @@
     <details>
       <summary>Post a translation job</summary>
       <form id="create">
-        <label>Translator's address<input name="translator" pattern="0x[0-9a-fA-F]{40}" required></label>
-        <label>Source page URL<input name="source" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
-        <label>Source SHA-256<input name="ssha" pattern="[0-9a-fA-F]{64}" required></label>
-        <p class="hint">Run <code>curl -s URL | shasum -a 256</code>, or try “Fill hash”.</p>
+        <label>Translator's address (leave empty to take applications)<input name="translator" pattern="0x[0-9a-fA-F]{40}"></label>
+        <label>Sections: one source page per line, <code>URL SHA-256</code> (1–10, each up to 12,000 characters)<textarea name="sources" required placeholder="https://…/part-1.html 3f2a…"></textarea></label>
+        <p class="hint">Hash each page with <code>curl -s URL | shasum -a 256</code>, or put URLs alone and try “Fill hash”. The fee splits equally between sections.</p>
         <div class="row">
           <label>Target language<input name="language" minlength="2" maxlength="40" required placeholder="Vietnamese"></label>
           <label>Days<input name="days" type="number" min="1" max="90" value="7" required></label>
-          <label>Fee (GEN)<input name="fee" inputmode="decimal" value="0.001" required></label>
+          <label>Total fee (GEN)<input name="fee" inputmode="decimal" value="0.001" required></label>
         </div>
         <label>Required terms, one per line (optional, max 20)<textarea name="terms"></textarea></label>
-        <div class="row"><button type="button" class="ghost" id="fill-ssha">Fill hash</button><button type="submit">Escrow fee and post</button></div>
+        <div class="row"><button type="button" class="ghost" id="fill-ssha">Fill hashes</button><button type="submit">Escrow fee and post</button></div>
       </form>
     </details>
   </div>
@@ -107,8 +106,8 @@
     <details><summary>Who decides whether a translation is faithful?</summary><p>GenLayer validators. Each one fetches both pages itself, checks their hashes, and answers three narrow questions: is anything missing, does anything say something different, is it the right language. A result is accepted only when they agree on the same issue list.</p></details>
     <details><summary>Will I be rejected for word choice or style?</summary><p>No. Only meaning counts: omissions, changed meaning and the wrong language. Phrasing a sentence differently is not an issue.</p></details>
     <details><summary>Can the translator swap the page after it is checked?</summary><p>No. The translation is pinned by its SHA-256 when submitted, and the paid URL and hash stay on the job. A page that changed reverts the submission without using an attempt.</p></details>
-    <details><summary>What if the translator never delivers?</summary><p>After the deadline, or after three rejected attempts, anyone can trigger the refund and the fee goes back to the client. The translator can also decline, which refunds immediately.</p></details>
-    <details><summary>How long are the documents?</summary><p>Up to 12,000 characters of visible text per page. Longer pages are refused up front, so a client finds out before paying.</p></details>
+    <details><summary>What if the translator never delivers?</summary><p>After the deadline, anyone can refund every unpaid section to the client; a section with three rejected attempts can be refunded on its own right away. The translator can also decline the rest, which refunds the unpaid sections immediately. Sections already paid stay paid.</p></details>
+    <details><summary>How long are the documents?</summary><p>Up to ten sections per job, each a page of up to 12,000 characters of visible text, paid on its own as soon as it passes. Longer pages are refused up front, so a client finds out before paying.</p></details>
   </div>
 </div></section>
 
@@ -120,14 +119,15 @@
 
 <script type="module">
 import { contract, wireWallet, send, status, gen, toWei, esc, short, $, EXPLORER, payingTx, finalizeTx } from "./gl.js";
-const ADDR = "0xBB122Fc6Ca64Dcfa9759bEFfd1C912cA7f9E72bb";
+const ADDR = "0x2185071D4F99bfFcD8F1EA613546bd5CFe83eb39";
 const fp = contract(ADDR);
 const B = BigInt, PER = 20;
 let me = null, items = [], view = { id: null, subs: [], next: 0, payouts: [], pnext: 0 };
 const when = (ts) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" }) + " UTC" : "–";
 const addr = (a) => `<a class="mono" href="${EXPLORER}/address/${esc(a)}">${short(a)}</a>${me && a.toLowerCase() === me.toLowerCase() ? " (you)" : ""}`;
 const sha256 = async (buf) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
-const cls = { OPEN: "", PAID: "ok", REFUNDED: "bad" };
+const cls = { OPEN: "", ASSIGNED: "", DONE: "ok", PAID: "ok", REFUNDED: "bad" };
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
 async function load(openId) {
   try {
@@ -135,11 +135,11 @@ async function load(openId) {
     for (let s = 0; s !== null; ) { const r = await fp.read("get_jobs", [s, 50]); all.push(...r.items); s = r.next; }
     items = all.reverse();
     const n = (st) => items.filter((j) => j.status === st).length;
-    const held = items.filter((j) => j.status === "OPEN").reduce((t, j) => t + B(j.amount), 0n);
-    $("#stats").innerHTML = [[items.length, "Jobs"], [n("OPEN"), "Open"], [n("PAID"), "Paid"], [gen(held), "In escrow (GEN)"]]
+    const held = items.reduce((t, j) => t + B(j.amount) - B(j.paid) - B(j.refunded), 0n);
+    $("#stats").innerHTML = [[items.length, "Jobs"], [n("OPEN"), "Taking applications"], [n("DONE"), "Done"], [gen(held), "In escrow (GEN)"]]
       .map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join("");
     $("#jobs").innerHTML = items.length ? items.map((j) => `<a class="item" href="#job-${j.id}" data-id="${j.id}">
-      <div><b>${esc(j.language)} · ${gen(j.amount)} GEN</b><small>#${j.id} · ${j.status.toLowerCase()} · ${j.attempts} attempt${j.attempts === 1 ? "" : "s"}</small></div></a>`).join("")
+      <div><b>${esc(j.language)} · ${gen(j.amount)} GEN</b><small>#${j.id} · ${j.status.toLowerCase()} · ${j.sections.filter((x) => x.status === "PAID").length}/${plural(j.sections.length, "section")} paid</small></div></a>`).join("")
       : `<p class="empty">No jobs yet.</p>`;
     const h = location.hash.match(/^#job-(\d+)$/), id = openId ?? (h ? Number(h[1]) : null);
     if (items.length) await open(Number.isInteger(id) && items.some((j) => j.id === id) ? id : items[0].id);
@@ -165,17 +165,27 @@ async function open(id) {
 }
 
 function actions(j, recov, now) {
-  if (!me) return `<p class="connect-hint">Connect a wallet to submit, decline or refund.</p>`;
-  const out = [], mine = (x) => x.toLowerCase() === me.toLowerCase(), open = j.status === "OPEN";
-  if (open && mine(j.translator) && j.attempts_left > 0 && now <= j.deadline) {
-    out.push(`<form data-form="submit"><b>Submit the translation (${j.attempts_left} attempt${j.attempts_left === 1 ? "" : "s"} left)</b>
+  if (!me) return `<p class="connect-hint">Connect a wallet to apply, submit, decline or refund.</p>`;
+  const out = [], mine = (x) => !!x && x.toLowerCase() === me.toLowerCase(), row = (hint, btn) => `<p class="hint">${hint}</p><div>${btn}</div>`;
+  const unpaid = j.sections.filter((x) => x.status === "OPEN"), due = j.sections.filter((x) => x.refundable);
+  if (j.status === "OPEN" && mine(j.client)) {
+    if (j.applicants.length) out.push(`<form data-form="assign" class="row" style="align-items:end"><label>Assign an applicant (the ${plural(j.days, "day")} start now)<select name="who">${j.applicants.map((a) => `<option value="${esc(a.address)}">${esc(a.address)} · ${a.paid} paid, ${a.rejected} refunded</option>`).join("")}</select></label><div><button>Assign</button></div></form>`);
+    out.push(`<form data-form="cancel" class="row" style="align-items:end">${row("No one is assigned yet: cancelling refunds the whole fee.", `<button class="ghost">Cancel job</button>`)}</form>`);
+  }
+  if (j.status === "OPEN" && !mine(j.client)) {
+    out.push(j.applicants.some((a) => mine(a.address))
+      ? `<form data-form="withdraw_application" class="row" style="align-items:end">${row("You applied. The client picks one applicant.", `<button class="ghost">Withdraw application</button>`)}</form>`
+      : `<form data-form="apply" class="row" style="align-items:end">${row(j.applicants.length >= 20 ? "The job has 20 applicants, the most it takes." : "Apply; the client sees your paid and refunded counts.", j.applicants.length >= 20 ? "" : `<button>Apply</button>`)}</form>`);
+  }
+  if (j.status === "ASSIGNED" && mine(j.translator) && now <= j.deadline) {
+    for (const x of unpaid.filter((x) => x.attempts_left > 0)) out.push(`<form data-form="submit" data-section="${x.id}"><b>Submit section ${x.id - j.sections[0].id + 1} (${plural(x.attempts_left, "attempt")} left)</b>
       <label>Translation URL<input name="url" type="url" pattern="https?://.{3,300}" required placeholder="https://…"></label>
       <label>Translation SHA-256<input name="sha" pattern="[0-9a-fA-F]{64}" required></label>
       <p class="hint">Keep the page unchanged until validators have fetched it. <code>curl -s URL | shasum -a 256</code></p>
       <div class="row"><button type="button" class="ghost" data-act="hash">Fill hash</button><button>Submit for review</button></div></form>`);
   }
-  if (open && mine(j.translator)) out.push(`<form data-form="decline" class="row" style="align-items:end"><p class="hint">Declining refunds the client.</p><div><button class="ghost">Decline job</button></div></form>`);
-  if (open && j.refundable) out.push(`<form data-form="refund" class="row" style="align-items:end"><p class="hint">${j.attempts_left === 0 ? "All attempts were rejected." : "The deadline has passed."} Anyone can refund the client.</p><div><button>Refund ${gen(j.amount)} GEN</button></div></form>`);
+  if (j.status === "ASSIGNED" && mine(j.translator) && unpaid.length) out.push(`<form data-form="decline" class="row" style="align-items:end">${row(`Declining refunds the client ${gen(B(j.share) * B(unpaid.length))} GEN for the unpaid sections; paid ones stay paid.`, `<button class="ghost">Decline the rest</button>`)}</form>`);
+  if (j.status === "ASSIGNED" && j.refundable) out.push(`<form data-form="refund" class="row" style="align-items:end">${row(`${now > j.deadline ? "The deadline has passed." : "All attempts were rejected on a section."} Anyone can refund the client.`, `<button>Refund ${gen(B(j.share) * B(due.length))} GEN</button>`)}</form>`);
   if (B(recov) > 0n) out.push(`<form data-form="recover" class="row" style="align-items:end"><label>Recover ${gen(recov)} GEN from a failed transfer, to<input name="to" pattern="0x[0-9a-fA-F]{40}" value="${esc(me)}" required></label><div><button>Recover</button></div></form>`);
   return out.length ? `<div style="display:grid;gap:16px;margin-top:20px">${out.join("")}</div>` : "";
 }
@@ -190,22 +200,26 @@ function verdict(s, terms) {
 
 async function show() {
   const j = items.find((x) => x.id === view.id);
-  const [recov, tr] = await Promise.all([me ? fp.read("get_recoverable", [me]) : 0, fp.read("get_translator", [j.translator])]);
-  const el = $("#detail"), now = Math.floor(Date.now() / 1000);
+  const [recov, tr] = await Promise.all([me ? fp.read("get_recoverable", [me]) : 0, j.translator ? fp.read("get_translator", [j.translator]) : null]);
+  const el = $("#detail"), now = Math.floor(Date.now() / 1000), first = j.sections[0].id;
   el.hidden = false;
-  el.innerHTML = `<div class="dhead"><div><small>Job #${j.id} · posted ${when(j.at)} · due ${when(j.deadline)}</small><h2>Into ${esc(j.language)} <span class="tag ${cls[j.status]}">${j.status.toLowerCase()}</span></h2>
-    <p>source <a href="${esc(j.source_url)}" rel="noopener nofollow">${esc(j.source_url)} ↗</a> · sha256 <span class="mono">${j.source_sha256.slice(0, 16)}…</span></p>
-    <p>client ${addr(j.client)} · translator ${addr(j.translator)} (${tr.paid} paid, ${tr.rejected} refunded after rejections)</p>
-    ${j.status === "PAID" ? `<p>paid translation <a href="${esc(j.translation_url)}" rel="noopener nofollow">${esc(j.translation_url)} ↗</a> · sha256 <span class="mono sig">${esc(j.translation_sha256)}</span></p>` : ""}</div></div>
+  el.innerHTML = `<div class="dhead"><div><small>Job #${j.id} · posted ${when(j.at)} · ${j.deadline ? `due ${when(j.deadline)}` : `${plural(j.days, "day")} from assignment`}</small><h2>Into ${esc(j.language)} <span class="tag ${cls[j.status]}">${j.status.toLowerCase()}</span></h2>
+    <p>client ${addr(j.client)} · translator ${tr ? `${addr(j.translator)} (${tr.paid} paid, ${tr.rejected} refunded after rejections)` : `not assigned, ${plural(j.applicants.length, "applicant")}`}</p></div></div>
     <div class="mini">
       <div><span>Fee</span><b>${gen(j.amount)} GEN</b></div>
-      <div><span>Attempts</span><b>${j.attempts} / 3</b></div>
+      <div><span>Per section</span><b>${gen(j.share)} GEN</b></div>
+      <div><span>Paid / refunded</span><b>${gen(j.paid)} / ${gen(j.refunded)}</b></div>
       <div><span>Required terms</span><b>${j.terms.length ? j.terms.map(esc).join(", ") : "none"}</b></div>
-      <div><span>Status</span><b>${j.status}</b></div>
     </div>
-    <h3>Submissions (${j.attempts})</h3>
+    <h3>Sections (${j.sections.length})</h3>
+    <div class="tbl"><table><tbody>${j.sections.map((x) => `<tr><td class="num mut">${x.id - first + 1}</td>
+      <td><a href="${esc(x.source_url)}" rel="noopener nofollow">${esc(x.source_url)} ↗</a> <span class="mono mut">${x.source_sha256.slice(0, 12)}…</span>
+      ${x.status === "PAID" ? `<br>paid: <a href="${esc(x.translation_url)}" rel="noopener nofollow">${esc(x.translation_url)} ↗</a> <span class="mono mut">${esc(x.translation_sha256.slice(0, 12))}…</span>` : ""}</td>
+      <td class="r">${x.status.toLowerCase()} · ${x.attempts}/3</td></tr>`).join("")}</tbody></table></div>
+    ${j.status === "OPEN" && j.applicants.length ? `<h3>Applicants (${j.applicants.length})</h3><p>${j.applicants.map((a) => `${addr(a.address)} · ${a.paid} paid, ${a.rejected} refunded`).join("<br>")}</p>` : ""}
+    <h3>Submissions (${j.sections.reduce((t, x) => t + x.attempts, 0)})</h3>
     ${view.subs.length ? view.subs.map((s) => `<div class="case">
-      <div class="case-top"><span class="id">${s.id}</span><span class="by">${when(s.at)} · <a href="${esc(s.url)}" rel="noopener nofollow">${esc(s.url)}</a> · sha256 ${s.sha256.slice(0, 16)}…</span></div>
+      <div class="case-top"><span class="id">${s.id}</span><span class="by">section ${s.section_id - first + 1} · ${when(s.at)} · <a href="${esc(s.url)}" rel="noopener nofollow">${esc(s.url)}</a> · sha256 ${s.sha256.slice(0, 16)}…</span></div>
       ${verdict(s, j.terms)}
     </div>`).join("") : `<p class="hint">Nothing submitted yet.</p>`}
     ${view.next !== null ? `<button class="ghost more" data-act="more-subs">More submissions</button>` : ""}
@@ -253,18 +267,32 @@ $("#detail").addEventListener("submit", async (e) => {
   const f = e.target, fn = f.dataset.form, id = view.id, j = items.find((x) => x.id === id);
   let args = [id], check, payee; // payee: who the call may pay (see gl.js)
   const after = (ok) => async () => ok(await fp.read("get_job", [id]));
-  if (fn === "submit") { args = [id, f.url.value.trim(), f.sha.value.toLowerCase()]; payee = j.translator; check = after((x) => x.attempts === j.attempts + 1); }
-  else if (fn === "decline" || fn === "refund") { payee = j.client; check = after((x) => x.status === "REFUNDED"); }
+  const applied = (x) => x.applicants.some((a) => a.address.toLowerCase() === me.toLowerCase());
+  if (fn === "submit") {
+    const sid = Number(f.dataset.section), k = j.sections.findIndex((x) => x.id === sid);
+    args = [sid, f.url.value.trim(), f.sha.value.toLowerCase()]; payee = j.translator; check = after((x) => x.sections[k].attempts === j.sections[k].attempts + 1);
+  }
+  else if (fn === "decline" || fn === "refund" || fn === "cancel") { payee = j.client; check = after((x) => B(x.refunded) > B(j.refunded)); }
+  else if (fn === "assign") { args = [id, f.who.value]; check = after((x) => x.status === "ASSIGNED"); }
+  else if (fn === "apply") check = after(applied);
+  else if (fn === "withdraw_application") check = after((x) => !applied(x));
   else { args = [f.to.value]; payee = f.to.value; check = async () => B(await fp.read("get_recoverable", [me])) === 0n; }
   if (await send(fp, fn, fn, args, 0n, check, payee)) load(id);
 });
-$("#fill-ssha").addEventListener("click", () => { const f = $("#create"); fill(f.ssha, f.source.value); });
+// Fills a missing hash for every "url" line of the sources box that the browser can read.
+$("#fill-ssha").addEventListener("click", async () => {
+  const f = $("#create"), lines = f.sources.value.split("\n").map((l) => l.trim()).filter(Boolean);
+  const done = await Promise.all(lines.map(async (l) => (l.includes(" ") ? l : `${l} ${await hashOf(l).catch(() => "?")}`)));
+  f.sources.value = done.join("\n");
+  status(done.some((l) => l.endsWith(" ?")) ? "Some pages could not be read from the browser (blocked by the site). Hash them with curl." : "Hashes filled from your browser.", done.some((l) => l.endsWith(" ?")));
+});
 $("#create").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
   try {
     const terms = f.terms.value.split("\n").map((t) => t.trim()).filter(Boolean);
-    const n = items.length, args = [f.translator.value.trim(), f.source.value.trim(), f.ssha.value.toLowerCase(), f.language.value.trim(), JSON.stringify(terms), Number(f.days.value)];
+    const sources = f.sources.value.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => l.split(/\s+/)).map(([u, h]) => [u, (h ?? "").toLowerCase()]);
+    const n = items.length, args = [f.translator.value.trim(), JSON.stringify(sources), f.language.value.trim(), JSON.stringify(terms), Number(f.days.value)];
     if (await send(fp, "Post job", "create_job", args, toWei(f.fee.value), async () => (await fp.read("get_jobs", [0, 1])).total === n + 1)) { f.reset(); load(n); }
   } catch (err) { status(err.message, true); }
 });
@@ -273,6 +301,6 @@ load();
 </script>
 <footer><div class="w">
   <a class="brand" href="#top"><svg viewBox="0 0 64 64" aria-hidden="true"><use href="logo.svg#m"/></svg><span>Faithful<em>Pay</em></span></a>
-  <nav><a href="https://github.com/cris-the-dev/genlayer-faithfulpay#readme">Docs</a><a href="https://github.com/cris-the-dev/genlayer-faithfulpay">GitHub</a><a href="https://explorer-bradbury.genlayer.com/address/0xBB122Fc6Ca64Dcfa9759bEFfd1C912cA7f9E72bb">Contract 0xBB12…72bb</a><a href="https://genlayer.com">Built on GenLayer</a></nav>
+  <nav><a href="https://github.com/cris-the-dev/genlayer-faithfulpay#readme">Docs</a><a href="https://github.com/cris-the-dev/genlayer-faithfulpay">GitHub</a><a href="https://explorer-bradbury.genlayer.com/address/0x2185071D4F99bfFcD8F1EA613546bd5CFe83eb39">Contract 0x2185…eb39</a><a href="https://genlayer.com">Built on GenLayer</a></nav>
 </div></footer>
 </body></html>

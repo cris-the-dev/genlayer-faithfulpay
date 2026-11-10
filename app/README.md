@@ -7,7 +7,7 @@ Files:
 - `index.html` — the page
 - `gl.js` — wallet + read/write helpers
 - `app.css` — shared styles
-- `check-actions.mjs` — asserts which controls the page shows per role and job state (`node app/check-actions.mjs app/index.html`, runs in CI)
+- `check-actions.mjs` — asserts which controls the page shows per role, job and section state (`node app/check-actions.mjs app/index.html`, runs in CI)
 - `genlayer.js` — not committed; a browser bundle of `genlayer-js@2.0.0-rc.2` (Bradbury Phase 2, fee deposits):
 
 ```bash
@@ -19,7 +19,7 @@ sed -i.bak 's/publicClient.call({ to: address, data, gasPrice: receiptGasPrice/p
 npx esbuild entry.js --bundle --format=esm --minify --platform=browser --outfile=app/genlayer.js
 ```
 
-Paying calls (`submit`, `refund`, `decline`, `recover`) send GEN out of the contract as an
+Paying calls (`submit`, `refund`, `decline`, `cancel`, `recover`) send GEN out of the contract as an
 external message, whose gas comes from the calling transaction's fee deposit: `gl.js` adds an External message
 allocation for the payee (100k gas at 1 gwei). A paying call sent without that allocation still succeeds but
 the transfer is never executed.
